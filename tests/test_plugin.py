@@ -231,13 +231,13 @@ def test_fetch_unknown_mode(plugin, toolaria):
 
 
 def test_ttl_sweep(plugin, toolaria):
+    """A TTL-expired blob's content is gone (file deleted)."""
     bid = toolaria._store.put("w" * 500, "web_search", session_id="test-s")
     idx = toolaria._store._load_idx("test-s")
     idx["blobs"][bid]["t"] = time.time() - 7200  # 2 hours, ttl is 1
     toolaria._store._save_idx(idx, "test-s")
     toolaria._store.lazy_sweep()
-    r = toolaria._fetch(args={"id": bid, "mode": "stat"}, session_id="test-s")
-    assert "not found" in r
+    assert not (toolaria._store.blob_dir / bid).exists()
 
 
 def test_cross_session_sweep_safety(plugin, toolaria):
@@ -253,6 +253,76 @@ def test_cross_session_sweep_safety(plugin, toolaria):
     toolaria._store.lazy_sweep()
     r = toolaria._store.fetch(bid, "stat", session_id="session-A")
     assert "not found" not in r, "Blob deleted while still referenced by session-B"
+
+
+def test_fetch_refreshes_blob_ttl(plugin, toolaria):
+    """Fetching a blob bumps its TTL so active use survives a sweep."""
+    bid = toolaria._store.put("w" * 500, "web_search", session_id="test-s")
+    # Age it almost to expiry, then fetch (which should refresh t to now).
+    idx = toolaria._store._load_idx("test-s")
+    idx["blobs"][bid]["t"] = time.time() - 3500  # ttl is 3600
+    toolaria._store._save_idx(idx, "test-s")
+    toolaria._fetch(args={"id": bid, "mode": "stat"}, session_id="test-s")
+    toolaria._store.lazy_sweep()
+    r = toolaria._fetch(args={"id": bid, "mode": "range", "start": 0, "count": 1},
+                        session_id="test-s")
+    assert "Swept" not in r and "not found" not in r
+
+
+def test_swept_blob_leaves_tombstone(plugin, toolaria):
+    bid = toolaria._store.put("data here", "web_extract", session_id="test-s")
+    idx = toolaria._store._load_idx("test-s")
+    idx["blobs"][bid]["t"] = time.time() - 7200
+    toolaria._store._save_idx(idx, "test-s")
+    toolaria._store.lazy_sweep()
+    assert not (toolaria._store.blob_dir / bid).exists()
+    idx = toolaria._store._load_idx("test-s")
+    assert "swept_at" in idx["blobs"][bid]
+
+
+def test_tombstone_fetch_names_tool_and_advises_rerun(plugin, toolaria):
+    bid = toolaria._store.put("data here", "web_extract", session_id="test-s")
+    idx = toolaria._store._load_idx("test-s")
+    idx["blobs"][bid]["t"] = time.time() - 7200
+    toolaria._store._save_idx(idx, "test-s")
+    toolaria._store.lazy_sweep()
+    r = toolaria._fetch(args={"id": bid, "mode": "stat"}, session_id="test-s")
+    assert "Swept" in r
+    assert "web_extract" in r
+    assert "re-run" in r
+
+
+def test_tombstone_expires_after_tombstone_ttl(plugin, toolaria):
+    bid = toolaria._store.put("data", "web_extract", session_id="test-s")
+    idx = toolaria._store._load_idx("test-s")
+    idx["blobs"][bid] = {"swept_at": time.time() - 800 * 3600,
+                         "tool": "web_extract", "size": 4}
+    toolaria._store._save_idx(idx, "test-s")
+    toolaria._store.lazy_sweep()  # tombstone_ttl is 720h
+    idx = toolaria._store._load_idx("test-s")
+    assert bid not in idx.get("blobs", {})
+
+
+def test_tombstone_not_served_cross_session(plugin, toolaria):
+    """A tombstone names a tool and size; it must not leak to another session."""
+    bid = toolaria._store.put("secret data", "web_extract", session_id="owner")
+    idx = toolaria._store._load_idx("owner")
+    idx["blobs"][bid]["t"] = time.time() - 7200
+    toolaria._store._save_idx(idx, "owner")
+    toolaria._store.lazy_sweep()
+    # Another session fetching the same id gets the bare not-found, no tool name
+    r = toolaria._fetch(args={"id": bid, "mode": "stat"}, session_id="intruder")
+    assert "web_extract" not in r
+    assert "not found" in r
+
+
+def test_size_sweep_also_tombstones(plugin, toolaria):
+    toolaria._store.cfg["max_store_mb"] = 0  # force eviction
+    bid = toolaria._store.put("x" * 5000, "web_search", session_id="test-s")
+    toolaria._store.lazy_sweep()
+    assert not (toolaria._store.blob_dir / bid).exists()
+    r = toolaria._fetch(args={"id": bid, "mode": "stat"}, session_id="test-s")
+    assert "Swept" in r
 
 
 def test_session_id_slugged(plugin, toolaria):

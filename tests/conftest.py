@@ -74,7 +74,7 @@ def base_cfg(tmp_path):
         "error_line_patterns": ["error", "fail"],
         "grep_timeout_ms": 500, "grep_max_pattern_len": 80,
         "grep_max_line_len": 2000,
-        "ttl_hours": 1, "max_store_mb": 50,
+        "ttl_hours": 1, "tombstone_ttl_hours": 720, "max_store_mb": 50,
         "store_path": str(tmp_path / "store"),
         "exclude_tools": [], "refuse_full_fetch": True,
     }

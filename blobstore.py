@@ -70,23 +70,65 @@ class BlobStore:
             self._save_idx(idx, sid)
         return bid
 
-    def _find_meta(self, blob_id: str, session_id: str = "") -> dict:
+    def _refresh_blob(self, blob_id: str, session_id: str) -> None:
+        """Bump the access time of a blob's index entry so a result the model
+        is still fetching survives the next TTL sweep.
+
+        Scoped to the owning session only: refresh is a best-effort touch, not
+        correctness-critical, so the all-session fan-out (one rewrite per
+        index file per fetch) is not worth the write amplification. Throttled
+        so back-to-back fetches do not rewrite the file each time."""
+        if not session_id:
+            return
+        now = time.time()
+        with _LOCK:
+            ip = self._idx_path(session_id)
+            idx = self._read_idx_file(ip)
+            entry = idx.get("blobs", {}).get(blob_id)
+            if entry and "swept_at" not in entry and now - entry.get("t", 0) > 60:
+                entry["t"] = now
+                self._write_idx_file(ip, idx)
+
+    def _tombstone_msg(self, blob_id: str, session_id: str = "") -> str | None:
+        """Return model-facing guidance if the blob was swept but a tombstone
+        survives, else None.
+
+        Scoped to the owning session: a tombstone names a tool and result
+        size, so it must not be served cross-session on a guessed id."""
+        if not session_id:
+            return None
+        meta = self._read_idx_file(self._idx_path(session_id)) \
+            .get("blobs", {}).get(blob_id, {})
+        if not meta or "swept_at" not in meta:
+            return None
+        tool = meta.get("tool", "the source tool")
+        size = meta.get("size", 0)
+        return (
+            f"[Swept] Blob {blob_id} (from {tool}, {size:,} chars) expired "
+            f"after the retention window. The content is gone; re-run {tool} "
+            f"to regenerate it."
+        )
+
+    def _find_meta(self, blob_id: str, session_id: str = "",
+                   include_swept: bool = False) -> dict:
         """Index metadata for a blob: the given session's entry, or the first
         entry found across all sessions (blobs are content-addressed, so any
-        session's metadata describes the same bytes)."""
-        if session_id:
-            meta = self._load_idx(session_id).get("blobs", {}).get(blob_id)
-            if meta:
-                return meta
-        for sf in sorted(self.meta_dir.glob("*.json")):
-            try:
-                idx = json.loads(sf.read_text())
-            except Exception:
+        session's metadata describes the same bytes).
+
+        Live entries are preferred; a tombstone is returned only when
+        *include_swept* is set and no live entry exists."""
+        paths = ([self._idx_path(session_id)] if session_id else []) \
+            + sorted(self.meta_dir.glob("*.json"))
+        tomb: dict = {}
+        for ip in paths:
+            meta = self._read_idx_file(ip).get("blobs", {}).get(blob_id)
+            if not meta:
                 continue
-            meta = idx.get("blobs", {}).get(blob_id)
-            if meta:
-                return meta
-        return {}
+            if "swept_at" in meta:
+                tomb = tomb or meta
+                continue
+            return meta
+        return tomb if include_swept else {}
 
     def fetch(self, blob_id: str, mode: str, start=0, count=20,
               pattern=None, session_id: str = ""):
@@ -97,19 +139,29 @@ class BlobStore:
         cap = self.cfg.get("fetch_max_chars", 4000)
         bpath = self.blob_dir / blob_id
         if not bpath.exists():
+            tomb = self._tombstone_msg(blob_id, session_id)
+            if tomb:
+                return tomb
             return f"Error: blob {blob_id} not found (may have been swept)"
 
-        if mode == "stat":
-            st = bpath.stat()
-            meta = self._find_meta(blob_id, session_id)
-            return (
-                f"blob: {blob_id}\n"
-                f"size: {st.st_size:,} bytes\n"
-                f"stored: {time.ctime(st.st_ctime)}\n"
-                f"tool: {meta.get('tool', '?')}"
-            )
+        # Touch the blob so an actively-used result does not expire mid-task.
+        self._refresh_blob(blob_id, session_id)
 
-        raw = bpath.read_bytes()
+        try:
+            if mode == "stat":
+                st = bpath.stat()
+                meta = self._find_meta(blob_id, session_id)
+                return (
+                    f"blob: {blob_id}\n"
+                    f"size: {st.st_size:,} bytes\n"
+                    f"stored: {time.ctime(st.st_ctime)}\n"
+                    f"tool: {meta.get('tool', '?')}"
+                )
+            raw = bpath.read_bytes()
+        except FileNotFoundError:
+            # Swept by a concurrent sweep between the existence check and read.
+            return (self._tombstone_msg(blob_id, session_id)
+                    or f"Error: blob {blob_id} not found (may have been swept)")
         try:
             text = raw.decode("utf-8")
         except UnicodeDecodeError:
@@ -208,76 +260,87 @@ class BlobStore:
     # ── sweep ──────────────────────────────
 
     def lazy_sweep(self):
-        """Remove blobs past TTL or over size limit. Oldest-first.
-        Cross-session: a blob is deleted only when NO session index
-        still references it."""
+        """Expire blobs past TTL or over the size limit, oldest first.
+
+        An expired index entry becomes a tombstone (keeps tool name and size,
+        drops the content) so a stale handle degrades into actionable
+        guidance rather than a bare error. The blob file is deleted once no
+        session holds a live reference. Tombstones themselves expire after
+        tombstone_ttl_hours."""
         ttl = self.cfg.get("ttl_hours", 72) * 3600
+        tomb_ttl = self.cfg.get("tombstone_ttl_hours", 720) * 3600
         max_mb = self.cfg.get("max_store_mb", 500)
         now = time.time()
         with _LOCK:
-            self._sweep_by_ttl(now, ttl)
+            self._sweep_by_ttl(now, ttl, tomb_ttl)
             self._sweep_by_size(now, max_mb)
 
-    def _sweep_by_ttl(self, now, ttl):
-        # Collect global reference count per blob across ALL sessions
-        ref_count: dict[str, int] = {}
-        for sf in sorted(self.meta_dir.glob("*.json")):
-            try:
-                idx = json.loads(sf.read_text())
-            except Exception:
-                continue
-            for bid in idx.get("blobs", {}):
-                ref_count[bid] = ref_count.get(bid, 0) + 1
+    @staticmethod
+    def _is_live(entry: dict) -> bool:
+        return "swept_at" not in entry
 
-        # For each session, remove TTL-expired entries from index
-        for sf in sorted(self.meta_dir.glob("*.json")):
-            try:
-                idx = json.loads(sf.read_text())
-            except Exception:
-                continue
+    def _sweep_by_ttl(self, now, ttl, tomb_ttl):
+        # For each session: expire live entries past TTL into tombstones, and
+        # drop tombstones past the tombstone TTL.
+        for ip in sorted(self.meta_dir.glob("*.json")):
+            idx = self._read_idx_file(ip)
             blobs = idx.get("blobs", {})
-            removed = 0
+            changed = False
             for bid, meta in list(blobs.items()):
-                if now - meta.get("t", 0) > ttl:
+                if self._is_live(meta):
+                    if now - meta.get("t", 0) > ttl:
+                        blobs[bid] = {
+                            "swept_at": now,
+                            "tool": meta.get("tool", ""),
+                            "size": meta.get("size", 0),
+                        }
+                        changed = True
+                elif now - meta.get("swept_at", 0) > tomb_ttl:
                     del blobs[bid]
-                    ref_count[bid] = ref_count.get(bid, 0) - 1
-                    removed += 1
-            if removed:
-                sf.write_text(json.dumps(idx))
+                    changed = True
+            if changed:
+                self._write_idx_file(ip, idx)
 
-        # Only delete files when no session references them
-        for bid, count in ref_count.items():
-            if count <= 0:
-                bpath = self.blob_dir / bid
-                if bpath.exists():
-                    bpath.unlink()
+        # Delete blob files no session holds a LIVE reference to.
+        for bf in self.blob_dir.iterdir():
+            if bf.is_file() and _BLOB_ID_RE.match(bf.name):
+                if not self._any_live_refs(bf.name):
+                    bf.unlink()
 
     def _sweep_by_size(self, now, max_mb):
         max_bytes = max_mb * 1024 * 1024
         all_blobs = []
         for bf in self.blob_dir.iterdir():
-            if bf.is_file() and len(bf.name) == 12:
+            if bf.is_file() and _BLOB_ID_RE.match(bf.name):
                 all_blobs.append((bf.stat().st_ctime, bf.stat().st_size, bf))
         all_blobs.sort()  # oldest first
         total = sum(sz for _, sz, _ in all_blobs)
         for _, sz, bf in all_blobs:
             if total <= max_bytes:
                 break
-            # Only evict if no session references it
-            if self._any_session_refs(bf.name):
-                continue
+            self._tombstone_everywhere(bf.name, now)
             if bf.exists():
                 bf.unlink()
             total -= sz
 
-    def _any_session_refs(self, bid: str) -> bool:
-        """True if any session index still references this blob."""
-        for sf in self.meta_dir.glob("*.json"):
-            try:
-                idx = json.loads(sf.read_text())
-            except Exception:
-                continue
-            if bid in idx.get("blobs", {}):
+    def _tombstone_everywhere(self, bid: str, now) -> None:
+        """Convert every live reference to a blob into a tombstone."""
+        for ip in sorted(self.meta_dir.glob("*.json")):
+            idx = self._read_idx_file(ip)
+            entry = idx.get("blobs", {}).get(bid)
+            if entry and self._is_live(entry):
+                idx["blobs"][bid] = {
+                    "swept_at": now,
+                    "tool": entry.get("tool", ""),
+                    "size": entry.get("size", 0),
+                }
+                self._write_idx_file(ip, idx)
+
+    def _any_live_refs(self, bid: str) -> bool:
+        """True if any session index holds a live (non-tombstone) reference."""
+        for ip in self.meta_dir.glob("*.json"):
+            entry = self._read_idx_file(ip).get("blobs", {}).get(bid)
+            if entry and self._is_live(entry):
                 return True
         return False
 
@@ -297,27 +360,33 @@ class BlobStore:
     def _idx_path(self, session_id: str):
         return self.meta_dir / f"{self._safe_sid(session_id)}.json"
 
-    def _load_idx(self, session_id: str):
-        ip = self._idx_path(session_id)
-        if ip.exists():
+    @staticmethod
+    def _read_idx_file(path: Path) -> dict:
+        if path.exists():
             try:
-                return json.loads(ip.read_text())
+                return json.loads(path.read_text())
             except Exception:
                 pass
         return {}
 
-    def _save_idx(self, idx: dict, session_id: str):
-        # Atomic write: temp file + os.replace so a concurrent reader from
-        # another session thread never sees partial JSON.
-        target = self._idx_path(session_id)
-        fd, tmp = tempfile.mkstemp(dir=target.parent, prefix=".tmp", suffix=".json")
+    @staticmethod
+    def _write_idx_file(path: Path, idx: dict) -> None:
+        # Atomic write: temp file + os.replace so a concurrent reader never
+        # sees partial JSON.
+        fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=".tmp", suffix=".json")
         try:
             with os.fdopen(fd, "w") as f:
                 json.dump(idx, f)
-            os.replace(tmp, target)
+            os.replace(tmp, path)
         except Exception:
             try:
                 os.unlink(tmp)
             except OSError:
                 pass
             raise
+
+    def _load_idx(self, session_id: str):
+        return self._read_idx_file(self._idx_path(session_id))
+
+    def _save_idx(self, idx: dict, session_id: str):
+        self._write_idx_file(self._idx_path(session_id), idx)
