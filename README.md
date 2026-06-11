@@ -1,3 +1,6 @@
+<img width="1254" height="1254" alt="Toolaria" src="https://github.com/user-attachments/assets/6510e5ef-3c09-4961-a5f2-c87da63a1c22" />
+
+
 # Toolaria — Rescue oversized tool results before they flood context
 
 Toolaria intercepts oversized tool outputs, stores them in a SHA256-addressed
