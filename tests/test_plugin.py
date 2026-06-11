@@ -227,6 +227,26 @@ def test_fetch_unknown_mode(plugin, toolaria):
     assert "unknown mode" in r
 
 
+def test_outline_mode_json(plugin, toolaria):
+    import json
+    rows = [{"id": i, "score": i * 1.5} for i in range(50)]
+    bid = toolaria._store.put(json.dumps(rows), "web_extract", session_id="test-s")
+    r = toolaria._fetch(args={"id": bid, "mode": "outline"}, session_id="test-s")
+    assert "JSON outline" in r
+    assert "score" in r and "min=" in r
+
+
+def test_outline_built_at_rescue(plugin, toolaria):
+    import json
+    raw = json.dumps([{"a": i, "label": f"row-{i}"} for i in range(1000)])
+    assert len(raw) > 8000  # over the rescue threshold
+    handle = toolaria._on_transform(tool_name="web_extract", result=raw)
+    assert "outline" in handle
+    bid = _parse_blob_id(handle)
+    # sidecar exists without a fetch having to build it
+    assert toolaria._store.read_sidecar(bid, "outline") is not None
+
+
 # ═══ Sweep ═══
 
 
@@ -267,6 +287,24 @@ def test_fetch_refreshes_blob_ttl(plugin, toolaria):
     r = toolaria._fetch(args={"id": bid, "mode": "range", "start": 0, "count": 1},
                         session_id="test-s")
     assert "Swept" not in r and "not found" not in r
+
+
+def test_sidecars_swept_with_blob(plugin, toolaria):
+    """Outline sidecars do not outlive their blob."""
+    import json, time as _t
+    raw = json.dumps([{"a": i} for i in range(1000)])
+    bid = toolaria._store.put(raw, "web_extract", session_id="test-s")
+    toolaria._store.build_outline(bid, raw)
+    assert toolaria._store.read_sidecar(bid, "outline") is not None
+    idx = toolaria._store._load_idx("test-s")
+    idx["blobs"][bid]["t"] = _t.time() - 7200
+    toolaria._store._save_idx(idx, "test-s")
+    toolaria._store.lazy_sweep()
+    assert toolaria._store.read_sidecar(bid, "outline") is None
+
+
+def test_sidecar_path_rejects_bad_id(plugin, toolaria):
+    assert toolaria._store.sidecar_path("../../etc/passwd", "outline") is None
 
 
 def test_swept_blob_leaves_tombstone(plugin, toolaria):

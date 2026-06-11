@@ -129,7 +129,7 @@ def register(ctx) -> None:
         toolset="rescuer",
         description=(
             "Fetch slices of a rescued oversized tool result. "
-            "Modes: range(start,count) | grep(pattern) | stat | full"
+            "Modes: outline | range(start,count) | grep(pattern) | stat | full"
         ),
         handler=_fetch,
         schema={
@@ -144,7 +144,7 @@ def register(ctx) -> None:
                     },
                     "mode": {
                         "type": "string",
-                        "enum": ["range", "grep", "stat", "full"],
+                        "enum": ["range", "grep", "stat", "full", "outline"],
                         "description": "Retrieval mode (default: stat)",
                     },
                     "start": {
@@ -215,6 +215,12 @@ def _rescue(result: str, tool_name: str, session_id: str = "") -> str | None:
 
     kind, meta = detect_type(result)
     excerpt = build_excerpt(result, kind, _cfg)
+    # Structural outline is cheap and deterministic; build it now so the
+    # model can navigate by structure on its first fetch.
+    try:
+        _store.build_outline(blob_id, result)
+    except Exception as exc:
+        logger.debug("toolaria: outline build failed for %s: %s", blob_id, exc)
     n_lines = result.count("\n") + 1
     head_lines = _cfg.get("head_lines", 40)
     tail_lines = _cfg.get("tail_lines", 15)
@@ -225,9 +231,11 @@ def _rescue(result: str, tool_name: str, session_id: str = "") -> str | None:
         f"Preview (first {head_lines} / last {tail_lines} lines); "
         f"this is a preview, NOT the full output:\n"
         f"{excerpt}\n"
-        f"Use rescuer_fetch(id=\"{blob_id}\", mode=\"range\"|\"grep\"|"
-        f"\"stat\"|\"full\") for the rest, e.g. "
-        f"rescuer_fetch(id=\"{blob_id}\", mode=\"grep\", pattern=\"<term>\")"
+        f"Retrieve more with rescuer_fetch(id=\"{blob_id}\", mode=...):\n"
+        f"  outline  structural map (sections / JSON schema / error clusters)\n"
+        f"  grep     regex match, e.g. mode=\"grep\", pattern=\"<term>\"\n"
+        f"  range    lines, e.g. mode=\"range\", start=0, count=20\n"
+        f"  stat | full"
     )
 
 

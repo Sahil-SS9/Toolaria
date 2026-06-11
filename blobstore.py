@@ -8,6 +8,15 @@ import time
 import threading
 from pathlib import Path
 
+try:
+    from .excerpt import detect_type as _detect_type
+    from .index import build_outline as _struct_outline
+    from .index import render_outline as _render_outline
+except ImportError:
+    from excerpt import detect_type as _detect_type  # type: ignore[no-redef]
+    from index import build_outline as _struct_outline  # type: ignore[no-redef]
+    from index import render_outline as _render_outline  # type: ignore[no-redef]
+
 _LOCK = threading.Lock()
 _BLOB_ID_RE = re.compile(r"^[0-9a-f]{12}$")
 
@@ -38,8 +47,72 @@ class BlobStore:
         bp = Path(cfg.get("store_path", "~/.hermes/toolaria")).expanduser().resolve()
         self.blob_dir = bp / "blobs"
         self.meta_dir = bp / "sessions"
+        self.sidecar_dir = bp / "sidecars"
         self.blob_dir.mkdir(parents=True, exist_ok=True)
         self.meta_dir.mkdir(parents=True, exist_ok=True)
+        self.sidecar_dir.mkdir(parents=True, exist_ok=True)
+
+    # ── sidecars (per-blob index/vector artefacts) ──
+
+    def sidecar_path(self, blob_id: str, suffix: str) -> Path | None:
+        if not _BLOB_ID_RE.match(blob_id):
+            return None
+        return self.sidecar_dir / f"{blob_id}.{suffix}.json"
+
+    def read_sidecar(self, blob_id: str, suffix: str):
+        p = self.sidecar_path(blob_id, suffix)
+        if p and p.exists():
+            try:
+                return json.loads(p.read_text())
+            except Exception:
+                return None
+        return None
+
+    def write_sidecar(self, blob_id: str, suffix: str, data) -> None:
+        p = self.sidecar_path(blob_id, suffix)
+        if p is None:
+            return
+        fd, tmp = tempfile.mkstemp(dir=p.parent, prefix=".tmp", suffix=".json")
+        try:
+            with os.fdopen(fd, "w") as f:
+                json.dump(data, f)
+            os.replace(tmp, p)
+        except Exception:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+
+    def delete_sidecars(self, blob_id: str) -> None:
+        for p in self.sidecar_dir.glob(f"{blob_id}.*.json"):
+            try:
+                p.unlink()
+            except OSError:
+                pass
+
+    def blob_text(self, blob_id: str) -> str | None:
+        """Decoded blob content, or None if missing or binary."""
+        bpath = self.blob_dir / blob_id
+        if not bpath.exists():
+            return None
+        try:
+            return bpath.read_bytes().decode("utf-8")
+        except (UnicodeDecodeError, OSError):
+            return None
+
+    def build_outline(self, blob_id: str, text: str) -> dict:
+        """Build and cache the structural outline for a blob (cheap, sync).
+        Safe to call at rescue time."""
+        kind, _ = _detect_type(text)
+        outline = _struct_outline(text, kind, self.cfg)
+        self.write_sidecar(blob_id, "outline", outline)
+        return outline
+
+    def _outline(self, blob_id: str, text: str) -> str:
+        cached = self.read_sidecar(blob_id, "outline")
+        if cached is None:
+            cached = self.build_outline(blob_id, text)
+        return _render_outline(cached)
 
     # ── blob i/o ──────────────────────────
 
@@ -166,6 +239,9 @@ class BlobStore:
             text = raw.decode("utf-8")
         except UnicodeDecodeError:
             return f"Error: blob {blob_id} is binary ({len(raw)} bytes)"
+
+        if mode == "outline":
+            return self._outline(blob_id, text)
 
         if mode == "full":
             max_full = self.cfg.get("full_fetch_max_chars", 50000)
@@ -301,11 +377,13 @@ class BlobStore:
             if changed:
                 self._write_idx_file(ip, idx)
 
-        # Delete blob files no session holds a LIVE reference to.
+        # Delete blob files no session holds a LIVE reference to, along with
+        # their sidecar index/vector artefacts.
         for bf in self.blob_dir.iterdir():
             if bf.is_file() and _BLOB_ID_RE.match(bf.name):
                 if not self._any_live_refs(bf.name):
                     bf.unlink()
+                    self.delete_sidecars(bf.name)
 
     def _sweep_by_size(self, now, max_mb):
         max_bytes = max_mb * 1024 * 1024
@@ -321,6 +399,7 @@ class BlobStore:
             self._tombstone_everywhere(bf.name, now)
             if bf.exists():
                 bf.unlink()
+            self.delete_sidecars(bf.name)
             total -= sz
 
     def _tombstone_everywhere(self, bid: str, now) -> None:
