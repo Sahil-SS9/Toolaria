@@ -42,21 +42,23 @@ def _tool_allowed(tool_name: str, cfg: dict, skip_tools: frozenset) -> bool:
     return not any(s in low for s in _SINK_DENY)
 
 
-def expand_value(value, store, cfg: dict, stats: dict):
+def expand_value(value, store, cfg: dict, stats: dict, session_id: str = ""):
     """Recursively expand tla: tokens in a JSON-shaped value.
 
     *stats* accumulates {"expanded": n, "total": chars} so the caller knows
     whether anything changed."""
     if isinstance(value, str):
-        return _expand_string(value, store, cfg, stats)
+        return _expand_string(value, store, cfg, stats, session_id)
     if isinstance(value, list):
-        return [expand_value(v, store, cfg, stats) for v in value]
+        return [expand_value(v, store, cfg, stats, session_id) for v in value]
     if isinstance(value, dict):
-        return {k: expand_value(v, store, cfg, stats) for k, v in value.items()}
+        return {k: expand_value(v, store, cfg, stats, session_id)
+                for k, v in value.items()}
     return value
 
 
-def _expand_string(text: str, store, cfg: dict, stats: dict) -> str:
+def _expand_string(text: str, store, cfg: dict, stats: dict,
+                   session_id: str = "") -> str:
     if "tla:" not in text:
         return text
     cap = int(cfg.get("passref_max_chars", 500000))
@@ -66,6 +68,14 @@ def _expand_string(text: str, store, cfg: dict, stats: dict) -> str:
         blob_id = m.group(1)
         if stats.get("total", 0) >= total_cap:
             return f"[Toolaria: total expansion budget {total_cap:,} chars exceeded]"
+        # Session scoping: when the host forwards a session_id, a blob the
+        # calling session does not reference is refused (it belongs to, or was
+        # guessed against, another session). An empty session_id means vanilla
+        # Hermes did not forward one, so we keep the global behaviour and let
+        # single-session setups work, mirroring fetch's all-session fallback.
+        if session_id and store and not store.session_references(blob_id, session_id):
+            stats["denied"] = stats.get("denied", 0) + 1
+            return f"[Toolaria: blob {blob_id} not available in this session]"
         content = store.blob_text(blob_id) if store else None
         if content is None:
             stats["missing"] = stats.get("missing", 0) + 1
@@ -92,8 +102,9 @@ def make_middleware(get_store, cfg: dict, skip_tools: frozenset):
         store = get_store()
         if store is None:
             return None
+        session_id = kwargs.get("session_id", "")
         stats: dict = {}
-        new_args = expand_value(args, store, cfg, stats)
+        new_args = expand_value(args, store, cfg, stats, session_id)
         if not stats:
             return None
         logger.debug("toolaria: pass-by-reference expanded %s for %s",

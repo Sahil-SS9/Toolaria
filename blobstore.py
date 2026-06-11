@@ -261,6 +261,19 @@ class BlobStore:
             f"to regenerate it."
         )
 
+    def session_references(self, blob_id: str, session_id: str) -> bool:
+        """True if *session_id*'s index holds a LIVE (non-tombstone) entry for
+        the blob.
+
+        Pass-by-reference uses this to confine expansion to the calling
+        session: blobs are content-addressed and shared, so a global read
+        would let one session expand another's blob by guessing a 12-hex id."""
+        if not session_id:
+            return False
+        entry = self._read_idx_file(self._idx_path(session_id)) \
+            .get("blobs", {}).get(blob_id)
+        return bool(entry) and "swept_at" not in entry
+
     def _find_meta(self, blob_id: str, session_id: str = "",
                    include_swept: bool = False) -> dict:
         """Index metadata for a blob: the given session's entry, or the first

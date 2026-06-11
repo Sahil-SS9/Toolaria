@@ -102,6 +102,33 @@ def test_allowlist_restricts_expansion(plugin, toolaria):
     assert mw(tool_name="publish", args={"x": f"tla:{bid}"}) is None
 
 
+def test_same_session_token_expands(plugin, toolaria):
+    """With a forwarded session_id, a blob the session owns expands in full."""
+    bid = toolaria._store.put("OWNED", "web_extract", session_id="sess-a")
+    mw = _mw(plugin, toolaria)
+    out = mw(tool_name="t", args={"x": f"tla:{bid}"}, session_id="sess-a")
+    assert out["args"]["x"] == "OWNED"
+
+
+def test_cross_session_token_denied(plugin, toolaria):
+    """A token for a blob the calling session does not reference is refused,
+    even though the bytes exist (another session put them)."""
+    bid = toolaria._store.put("SECRET", "web_extract", session_id="owner")
+    mw = _mw(plugin, toolaria)
+    out = mw(tool_name="t", args={"x": f"tla:{bid}"}, session_id="intruder")
+    assert "not available in this session" in out["args"]["x"]
+    assert "SECRET" not in out["args"]["x"]
+
+
+def test_empty_session_id_still_expands(plugin, toolaria):
+    """Back-compat: no forwarded session_id keeps the global read so vanilla
+    single-session Hermes still works."""
+    bid = toolaria._store.put("GLOBAL", "web_extract", session_id="some-s")
+    mw = _mw(plugin, toolaria)
+    out = mw(tool_name="t", args={"x": f"tla:{bid}"})
+    assert out["args"]["x"] == "GLOBAL"
+
+
 def test_total_expansion_budget(plugin, toolaria):
     toolaria._cfg["passref_total_max_chars"] = 500
     bid = toolaria._store.put("z" * 800, "web_extract", session_id="test-s")

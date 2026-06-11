@@ -209,9 +209,11 @@ per-call size caps bound how much content one tool call can pull in.
 - **Pass-by-reference lands silently.** Expanded content reaches a tool without
   appearing in context, so it also bypasses any human or filter inspecting
   model-emitted args. Exec/exfil sinks are denied by default and a strict
-  allowlist is available; cross-session expansion of a guessed blob id is bounded
-  by the same content-addressed id as fetch but is not session-scoped (acceptable
-  for single-operator use, revisit for multi-tenant).
+  allowlist is available. Expansion is session-scoped when the host forwards a
+  `session_id`: a token for a blob the calling session does not reference is
+  refused, so cross-session expansion of a guessed id is no longer served. When
+  no `session_id` is forwarded (vanilla Hermes), expansion falls back to the
+  global content-addressed read so single-session setups still work.
 - **Store cap is approximate.** `max_store_mb` counts blob bytes; per-blob
   sidecars (outline, chunks, vectors) add to on-disk size and are swept with
   their blob, but are not counted toward the cap.
