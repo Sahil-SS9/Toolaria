@@ -1,6 +1,7 @@
 # Session state and blob stores
 store/
 *.json
+!tests/fixture_*.json
 
 # Python
 __pycache__/
