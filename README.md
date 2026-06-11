@@ -214,9 +214,10 @@ per-call size caps bound how much content one tool call can pull in.
   refused, so cross-session expansion of a guessed id is no longer served. When
   no `session_id` is forwarded (vanilla Hermes), expansion falls back to the
   global content-addressed read so single-session setups still work.
-- **Store cap is approximate.** `max_store_mb` counts blob bytes; per-blob
-  sidecars (outline, chunks, vectors) add to on-disk size and are swept with
-  their blob, but are not counted toward the cap.
+- **Store cap is approximate.** `max_store_mb` now counts each blob's file
+  bytes plus its per-blob sidecars (outline, chunks, vectors), since eviction
+  frees both. It remains approximate: the cap is enforced at sweep time, not on
+  every write, so usage can briefly exceed it between sweeps.
 - **Swept content is gone.** After `ttl_hours` (or size eviction) the blob file
   is deleted. A later fetch returns re-run guidance, not the content. Handles
   embedded in old compaction summaries therefore degrade gracefully rather than

@@ -434,6 +434,28 @@ def test_size_sweep_also_tombstones(plugin, toolaria):
     assert "Swept" in r
 
 
+def test_size_sweep_counts_sidecar_bytes(plugin, toolaria):
+    """Blob file bytes fit under the cap, but blob + sidecars exceed it, so
+    eviction must still fire. Without counting sidecars the blob would survive."""
+    import json
+    raw = json.dumps([{"a": i, "label": f"row-{i}"} for i in range(1000)])
+    bid = toolaria._store.put(raw, "web_extract", session_id="test-s")
+    # Build outline + chunks sidecars; vectors are skipped (embeddings absent).
+    toolaria._store.build_outline(bid, raw)
+    toolaria._store._chunks(bid, raw)
+
+    blob_bytes = (toolaria._store.blob_dir / bid).stat().st_size
+    sidecar_bytes = toolaria._store._sidecar_bytes(bid)
+    assert sidecar_bytes > 0
+    # Cap sits between blob-only and blob+sidecar totals: blob alone fits.
+    cap_bytes = blob_bytes + sidecar_bytes // 2
+    toolaria._store.cfg["max_store_mb"] = cap_bytes / (1024 * 1024)
+
+    toolaria._store.lazy_sweep()
+    assert not (toolaria._store.blob_dir / bid).exists()
+    assert toolaria._store._sidecar_bytes(bid) == 0
+
+
 def test_session_id_slugged(plugin, toolaria):
     """Hostile session ids cannot escape the sessions directory."""
     toolaria._store.put("data", "web_search", session_id="../../evil")

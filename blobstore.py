@@ -481,12 +481,26 @@ class BlobStore:
                     bf.unlink()
                     self.delete_sidecars(bf.name)
 
+    def _sidecar_bytes(self, bid: str) -> int:
+        """On-disk bytes of a blob's sidecars. These are deleted with the blob
+        on eviction, so they count toward the store cap alongside it."""
+        total = 0
+        for p in self.sidecar_dir.glob(f"{bid}.*.json"):
+            try:
+                total += p.stat().st_size
+            except OSError:
+                pass
+        return total
+
     def _sweep_by_size(self, now, max_mb):
         max_bytes = max_mb * 1024 * 1024
         all_blobs = []
         for bf in self.blob_dir.iterdir():
             if bf.is_file() and _BLOB_ID_RE.match(bf.name):
-                all_blobs.append((bf.stat().st_ctime, bf.stat().st_size, bf))
+                # A blob's cap weight is its file plus its sidecars, since
+                # eviction frees both.
+                sz = bf.stat().st_size + self._sidecar_bytes(bf.name)
+                all_blobs.append((bf.stat().st_ctime, sz, bf))
         all_blobs.sort()  # oldest first
         total = sum(sz for _, sz, _ in all_blobs)
         for _, sz, bf in all_blobs:
