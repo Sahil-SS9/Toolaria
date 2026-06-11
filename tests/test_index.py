@@ -42,6 +42,35 @@ def test_chunk_terminates_tiny_target():
     assert chunks[-1].end_line == 49
 
 
+def test_single_long_line_char_windowed():
+    """Minified JSON on one line must split into many bounded chunks."""
+    text = "x" * 10000  # one line, no newlines
+    chunks = chunk_lines(text, target_chars=600)
+    assert len(chunks) > 1
+    assert all(c.start_line == 0 and c.end_line == 0 for c in chunks)
+    assert all(len(c.text) <= 600 for c in chunks)
+    # windows overlap, so the joined length exceeds the original
+    assert sum(len(c.text) for c in chunks) > len(text)
+
+
+def test_long_line_window_finds_mid_marker():
+    """A marker deep inside a single long line lands in some window."""
+    text = ("a" * 4000) + "UNIQUEMARKER" + ("b" * 4000)
+    chunks = chunk_lines(text, target_chars=600)
+    assert any("UNIQUEMARKER" in c.text for c in chunks)
+
+
+def test_mixed_long_and_short_lines():
+    text = "short one\n" + ("z" * 3000) + "\nshort two"
+    chunks = chunk_lines(text, target_chars=500)
+    # the long middle line (index 1) produced several windows
+    line1 = [c for c in chunks if c.start_line == 1]
+    assert len(line1) > 1
+    # the short lines are still represented
+    assert any("short one" in c.text for c in chunks)
+    assert any("short two" in c.text for c in chunks)
+
+
 # ── JSON outline ────────────────────────────────────────────────────────────
 
 
