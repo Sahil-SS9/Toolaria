@@ -1,0 +1,17 @@
+# Defaults for toolaria plugin.
+# Override in ~/.hermes/config.yaml under toolaria: key.
+toolaria:
+  max_result_chars: 8000
+  fetch_max_chars: 4000
+  head_lines: 40
+  tail_lines: 15
+  json_head_items: 5
+  json_tail_items: 2
+  error_line_patterns: ["error", "fail", "exception", "fatal", "warn"]
+  grep_timeout_ms: 500
+  grep_max_pattern_len: 80
+  ttl_hours: 72
+  max_store_mb: 500
+  store_path: ~/.hermes/toolaria
+  exclude_tools: []
+  refuse_full_fetch: true
