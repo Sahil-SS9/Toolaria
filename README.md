@@ -13,7 +13,7 @@ call `rescuer_fetch` to retrieve specific slices (range, grep, stat, or full).
 
 ```bash
 # Clone into Hermes plugins directory
-git clone https://github.com/Sahil-SS9/hermes-toolaria.git ~/.hermes/plugins/toolaria
+git clone https://github.com/Sahil-SS9/Toolaria.git ~/.hermes/plugins/toolaria
 
 # Enable in ~/.hermes/config.yaml:
 plugins:
