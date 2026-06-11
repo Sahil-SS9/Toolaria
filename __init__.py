@@ -1,11 +1,11 @@
-"""Toolaria — Rescue oversized tool results before they flood context.
+"""Toolaria: rescue oversized tool results before they flood context.
 
 Stores full results to disk via SHA256-addressed blob store.
 Returns excerpt + handle block.  Provides rescuer_fetch tool for retrieval.
 
 V1 catchment: MCP and web tool results only (terminal/file-read outputs are
 already truncated by tool_output_limits before any hook fires).
-Explicit allow-list enforced — only rescued tools get intercepted.
+Explicit allow-list enforced; only rescued tools get intercepted.
 """
 from __future__ import annotations
 
@@ -25,7 +25,7 @@ logger = logging.getLogger(__name__)
 _store: BlobStore | None = None
 _cfg: dict = {}
 
-# Tools whose results may exceed context — the only built-ins rescued.
+# Tools whose results may exceed context: the only built-ins rescued.
 # MCP tools are detected dynamically via the registry toolset prefix.
 _RESCUABLE_TOOLS: set[str] = {
     "web_extract",
@@ -251,7 +251,7 @@ def _on_end(**kwargs):
 
 
 def _fetch(args: dict | None = None, **kwargs) -> str:
-    """Handle rescuer_fetch tool calls — dispatched by plugin tool registry.
+    """Handle rescuer_fetch tool calls, dispatched by plugin tool registry.
 
     Reads session_id from kwargs when the dispatch layer forwards it; the
     store falls back to an all-session metadata search otherwise."""

@@ -1,5 +1,9 @@
 # Toolaria Design Document
 
+This is the spill-to-disk / context-offloading pattern (see the README's Prior
+art section); the design notes here cover Toolaria's specific choices, not the
+novelty of the idea.
+
 ## Problem
 
 Hermes Agent truncates tool outputs by size (20K bytes, 2000 lines) before
@@ -20,22 +24,25 @@ model retrieve specific slices on demand.
    the excerpt (best-effort) or use `rescuer_fetch` for precise access.
 2. **Deterministic.** No LLM judgement in the rescue path. All decisions
    (size threshold, tool allow-list, excerpt structure) are config-driven.
-3. **Fail-open.** Errors in the hook return the raw result unmodified.
-   Intercepting a tool is always preferable to flooding context, but
-   four critical tools are unconditionally excluded.
-4. **No cross-session leakage.** Blob store uses per-session indexes.
-   Session A cannot see session B's rescued results.
-5. **Self-cleaning.** TTL sweep (72h default) and size cap (500MB default)
-   prevent unbounded disk growth.
+3. **Fail-safe storage.** If the blob store is unavailable or a write fails,
+   the original result passes through untouched. A handle is never emitted
+   for content that is not durably on disk; a handle that cannot be fetched
+   is worse than no rescue.
+4. **Fail-open interception.** When the registry import fails, `_is_rescuable`
+   errs towards rescuing, but the unconditional excludes list still protects
+   critical tools.
+5. **Graceful expiry.** TTL sweep (72h default) and size cap (500MB default)
+   bound disk growth. An expired blob leaves a tombstone so a stale handle
+   degrades into re-run guidance rather than a bare error.
 
 ## Excluded tools
 
 The following are never intercepted regardless of config:
 
-- `delegate_task`, `session_search` — bounded results by design
-- `cronjob`, `skill_view`, `skill_manage`, `skill_request` — system tools
-- `kanban_create`, `open_kanban` — board operations
-- `clarify`, `memory` — interactive tools with small outputs
+- `delegate_task`, `session_search`: bounded results by design
+- `cronjob`, `skill_view`, `skill_manage`, `skill_request`: system tools
+- `kanban_create`, `open_kanban`: board operations
+- `clarify`, `memory`: interactive tools with small outputs
 
 ## Fail-open safety in production
 
@@ -52,7 +59,10 @@ by user config.
 
 - Blobs: one file per unique SHA256. Identical outputs from different tools
   share the same blob, but each session tracks its own reference.
-- Grep: pattern validation (length, character class, nested quantifiers) +
-  500ms wall-clock timeout protects against regex DoS.
-- Sweep: `lazy_sweep()` runs on session start and end, evicting blobs with
-  zero session references.
+- Grep: with the `regex` package every pattern runs under a per-search
+  timeout, the only reliable defence against catastrophic backtracking
+  (a between-lines timeout cannot interrupt a single C-level `re.search`).
+  Without `regex`, grep falls back to literal substring search and refuses
+  metacharacter patterns. Pattern length and per-line slice are also capped.
+- Sweep: `lazy_sweep()` runs on session start and end, tombstoning expired
+  blobs and deleting blob files once no live reference remains.

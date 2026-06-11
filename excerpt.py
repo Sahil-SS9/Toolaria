@@ -11,7 +11,7 @@ def _err_re(patterns: tuple):
 
 
 def detect_type(raw: str):
-    """Return (kind: str, meta: str) — detects JSON, HTML, code, text, binary."""
+    """Return (kind: str, meta: str): detects JSON, HTML, code, text, binary."""
     if raw is None:
         return ("binary", "None")
     if isinstance(raw, bytes):
@@ -73,10 +73,10 @@ def build_excerpt(raw: str, kind: str, cfg: dict):
     """Build excerpt from raw + kind. cfg keys: head_lines, tail_lines,
     json_head_items, json_tail_items, error_line_patterns."""
     if kind == "binary":
-        return f"[binary data — {len(raw) if isinstance(raw, bytes) else 'unknown'} bytes]"
+        return f"[binary data, {len(raw) if isinstance(raw, bytes) else 'unknown'} bytes]"
 
     if not isinstance(raw, str):
-        return f"[{kind} — {(str(raw)[:200])}]"
+        return f"[{kind}: {(str(raw)[:200])}]"
 
     lines = raw.splitlines()
     hl = cfg.get("head_lines", 40)
@@ -91,7 +91,7 @@ def build_excerpt(raw: str, kind: str, cfg: dict):
                               ensure_ascii=False)
             tail = json.dumps(_safe_json_tail(obj, tail_n), indent=2,
                               ensure_ascii=False)
-            parts = [f"[JSON excerpt — {kind_desc(raw, obj)}]"]
+            parts = [f"[JSON excerpt: {kind_desc(raw, obj)}]"]
             parts.append("--- head ---")
             parts.append(head)
             # Show the tail only when the container has more items than the
