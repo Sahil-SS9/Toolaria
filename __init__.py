@@ -16,9 +16,11 @@ from pathlib import Path
 try:
     from .blobstore import BlobStore, _BLOB_ID_RE
     from .excerpt import detect_type, build_excerpt
+    from .passref import make_middleware as _make_passref_mw
 except ImportError:
     from blobstore import BlobStore, _BLOB_ID_RE  # type: ignore[no-redef]
     from excerpt import detect_type, build_excerpt  # type: ignore[no-redef]
+    from passref import make_middleware as _make_passref_mw  # type: ignore[no-redef]
 
 logger = logging.getLogger(__name__)
 
@@ -123,6 +125,17 @@ def register(ctx) -> None:
     ctx.register_hook("transform_tool_result", _on_transform)
     ctx.register_hook("on_session_start", _on_start)
     ctx.register_hook("on_session_end", _on_end)
+
+    # Pass-by-reference: expand tla:<id> tokens in downstream tool args into
+    # full blob content before the tool runs, so a rescued result can flow
+    # tool to tool without ever re-entering the model's context. Always
+    # registered when the host supports middleware; passref_enabled is the
+    # single live on/off check, inside the callback.
+    if hasattr(ctx, "register_middleware"):
+        ctx.register_middleware(
+            "tool_request",
+            _make_passref_mw(lambda: _store, _cfg, _UNCONDITIONAL_EXCLUDES),
+        )
 
     ctx.register_tool(
         name="rescuer_fetch",
@@ -242,7 +255,10 @@ def _rescue(result: str, tool_name: str, session_id: str = "") -> str | None:
         f"  search   find by meaning, e.g. mode=\"search\", query=\"<question>\"\n"
         f"  grep     regex match, e.g. mode=\"grep\", pattern=\"<term>\"\n"
         f"  range    lines, e.g. mode=\"range\", start=0, count=20\n"
-        f"  stat | full"
+        f"  stat | full\n"
+        f"To feed this whole result into another tool WITHOUT reading it, pass "
+        f"\"tla:{blob_id}\" as that tool's argument; Toolaria expands it to the "
+        f"full content before the tool runs."
     )
 
 
