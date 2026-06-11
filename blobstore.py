@@ -9,32 +9,45 @@ import threading
 from pathlib import Path
 
 _LOCK = threading.Lock()
-# Allow spaces so multi-word patterns work (e.g. "error failed").
-# Single-line regex is bounded by quantifier rejection and 500ms wall clock.
-_SAFE_PAT = re.compile(r"^[a-zA-Z0-9_.*?^$()\[\]{}\\\|+\-/ ]+$")
-_NESTED_QUANT_RE = re.compile(r"[*+?{}]\s*[*+?{}]|\{[^}]*\}[*+?{]|\+\+|\*\*|\?\?")
 _BLOB_ID_RE = re.compile(r"^[0-9a-f]{12}$")
+
+# The grep engine. Arbitrary user regex against adversarial blob content is a
+# ReDoS hazard that no static denylist fully closes (e.g. a*a*a*...X or
+# (a|a)*X backtrack exponentially in C, where a between-lines timeout never
+# fires). The `regex` module honours a mid-search timeout, so when it is
+# present every pattern is bounded. Without it we fall back to literal
+# substring search only (linear, safe); metacharacter patterns are refused
+# with a hint to install `regex`.
+try:
+    import regex as _regex_engine
+    _HAVE_REGEX = True
+except ImportError:
+    _regex_engine = None
+    _HAVE_REGEX = False
+
+# Patterns containing any of these are "regex" rather than literal; refused on
+# the fallback path.
+_META_CHARS = set(r".^$*+?{}[]\|()")
+# Control characters are never allowed in a pattern.
+_CONTROL_RE = re.compile(r"[\x00-\x1f]")
 
 
 class BlobStore:
-    def __init__(self, cfg: dict, session_id: str):
+    def __init__(self, cfg: dict):
         self.cfg = cfg
         bp = Path(cfg.get("store_path", "~/.hermes/toolaria")).expanduser().resolve()
         self.blob_dir = bp / "blobs"
         self.meta_dir = bp / "sessions"
         self.blob_dir.mkdir(parents=True, exist_ok=True)
         self.meta_dir.mkdir(parents=True, exist_ok=True)
-        self._session_id = session_id  # startup default only — callers pass sid explicitly
 
     # ── blob i/o ──────────────────────────
 
     def put(self, content: str, tool_name: str = "", session_id: str = "") -> str:
         """Store content, return short blob_id (first 12 hex of SHA256).
 
-        *session_id* is the owning session — required for correct per-session
-        indexing.  Must be passed explicitly by every caller; the instance
-        ``_session_id`` is a startup default only and must never be mutated
-        by concurrent callers."""
+        *session_id* is the owning session; callers must pass it so the
+        per-session index stays correct under concurrent sessions."""
         if isinstance(content, str):
             raw = content.encode("utf-8")
         else:
@@ -42,7 +55,7 @@ class BlobStore:
         bhash = hashlib.sha256(raw).hexdigest()
         bid = bhash[:12]
         bpath = self.blob_dir / bid
-        sid = session_id or self._session_id
+        sid = session_id or "unknown"
         with _LOCK:
             if not bpath.exists():
                 bpath.write_bytes(raw)
@@ -57,22 +70,38 @@ class BlobStore:
             self._save_idx(idx, sid)
         return bid
 
-    def fetch(self, blob_id: str, mode: str, start=0, count=20,
-              pattern=None, cap=4000, session_id: str = ""):
-        """Retrieve slice of a blob. modes: range, grep, stat, full.
-        blob_id is validated at the caller (plugin __init__._fetch)."""
-        sid = session_id or self._session_id
-        if not _BLOB_ID_RE.match(blob_id):
-            return f"Error: invalid blob id '{blob_id}' — expected 12 hex chars"
+    def _find_meta(self, blob_id: str, session_id: str = "") -> dict:
+        """Index metadata for a blob: the given session's entry, or the first
+        entry found across all sessions (blobs are content-addressed, so any
+        session's metadata describes the same bytes)."""
+        if session_id:
+            meta = self._load_idx(session_id).get("blobs", {}).get(blob_id)
+            if meta:
+                return meta
+        for sf in sorted(self.meta_dir.glob("*.json")):
+            try:
+                idx = json.loads(sf.read_text())
+            except Exception:
+                continue
+            meta = idx.get("blobs", {}).get(blob_id)
+            if meta:
+                return meta
+        return {}
 
+    def fetch(self, blob_id: str, mode: str, start=0, count=20,
+              pattern=None, session_id: str = ""):
+        """Retrieve a slice of a blob. Modes: range, grep, stat, full."""
+        if not _BLOB_ID_RE.match(blob_id):
+            return f"Error: invalid blob id '{blob_id}' (expected 12 hex chars)"
+
+        cap = self.cfg.get("fetch_max_chars", 4000)
         bpath = self.blob_dir / blob_id
         if not bpath.exists():
             return f"Error: blob {blob_id} not found (may have been swept)"
 
         if mode == "stat":
             st = bpath.stat()
-            idx = self._load_idx(sid)
-            meta = idx.get("blobs", {}).get(blob_id, {})
+            meta = self._find_meta(blob_id, session_id)
             return (
                 f"blob: {blob_id}\n"
                 f"size: {st.st_size:,} bytes\n"
@@ -87,14 +116,29 @@ class BlobStore:
             return f"Error: blob {blob_id} is binary ({len(raw)} bytes)"
 
         if mode == "full":
-            return text[:cap]
+            max_full = self.cfg.get("full_fetch_max_chars", 50000)
+            if self.cfg.get("refuse_full_fetch", True) and len(text) > max_full:
+                return (
+                    f"Refused: blob is {len(text):,} chars, over the "
+                    f"{max_full:,} char full-fetch limit. "
+                    f"Use mode='range' or mode='grep' instead."
+                )
+            return text
 
         lines = text.splitlines()
 
         if mode == "range":
+            total = len(lines)
             start = max(0, start)
-            end = start + max(1, count)
-            return "\n".join(lines[start:end])[:cap]
+            note = ""
+            if start >= total and total > 0:
+                note = f"[start {start} past end; clamped]\n"
+                start = max(0, total - max(1, count))
+            end = min(total, start + max(1, count))
+            body = "\n".join(lines[start:end])[:cap]
+            return (
+                f"{note}[lines {start}..{end - 1} of {total}]\n{body}"
+            )
 
         if mode == "grep":
             if not pattern:
@@ -106,38 +150,59 @@ class BlobStore:
     # ── grep with timeout/complexity cap ───
 
     def _grep_safe(self, lines: list, pattern: str, cap: int) -> str:
-        """Regex grep with 500ms wall-clock timeout and anti-backtracking caps.
-        Timeout check runs BETWEEN lines — a single-line regex is bounded by
-        the per-line length (capped by tool output limits upstream) and by
-        nested quantifier rejection below."""
+        """Search each line for *pattern*, bounded against ReDoS.
+
+        With the `regex` module: full regex, each search capped by a
+        mid-match wall-clock timeout. Without it: literal substring only
+        (linear, safe); metacharacter patterns are refused."""
         plen = len(pattern)
         pmax = self.cfg.get("grep_max_pattern_len", 80)
         if plen > pmax:
             return f"Error: pattern too long ({plen} > {pmax})"
-        if not _SAFE_PAT.match(pattern):
-            return "Error: pattern contains unsafe characters"
-        if _NESTED_QUANT_RE.search(pattern):
-            return "Error: nested quantifiers detected — risk of catastrophic backtracking"
+        if _CONTROL_RE.search(pattern):
+            return "Error: pattern contains control characters"
 
-        timeout = self.cfg.get("grep_timeout_ms", 500) / 1000.0
+        per_line_timeout = self.cfg.get("grep_timeout_ms", 500) / 1000.0
+        wall_timeout = max(per_line_timeout, 2.0)
+        line_cap = self.cfg.get("grep_max_line_len", 2000)
+
+        if _HAVE_REGEX:
+            try:
+                preg = _regex_engine.compile(pattern, _regex_engine.I)
+            except _regex_engine.error as e:
+                return f"Error: invalid regex: {e}"
+
+            def matches(line: str) -> bool:
+                try:
+                    return bool(preg.search(line[:line_cap],
+                                            timeout=per_line_timeout))
+                except TimeoutError:
+                    return False
+        else:
+            if set(pattern) & _META_CHARS:
+                return ("Error: regex patterns need the optional 'regex' "
+                        "package; install it, or use a literal substring")
+            needle = pattern.lower()
+
+            def matches(line: str) -> bool:
+                return needle in line[:line_cap].lower()
+
         t0 = time.time()
         results = []
-        try:
-            preg = re.compile(pattern, re.I)
-        except re.error as e:
-            return f"Error: invalid regex: {e}"
-
-        for line in lines:
-            if time.time() - t0 > timeout:
-                results.append(f"[grep timed out after {timeout}s — {len(results)} matches]")
+        total = len(lines)
+        for n, line in enumerate(lines):
+            if time.time() - t0 > wall_timeout:
+                results.append(
+                    f"[grep timed out after {wall_timeout}s; "
+                    f"{len(results)} matches]")
                 break
-            if preg.search(line):
-                results.append(line[:500])
+            if matches(line):
+                results.append(f"{n}: {line[:500]}")
                 if len(results) >= 50:
-                    results.append("[50 matches — capped]")
+                    results.append("[50 matches; capped]")
                     break
         if not results:
-            return f"[no matches for pattern '{pattern}']"
+            return f"[no matches for pattern '{pattern}' in {total} lines]"
         return "\n".join(results)[:cap]
 
     # ── sweep ──────────────────────────────
@@ -218,11 +283,22 @@ class BlobStore:
 
     # ── session index helpers ──────────────
 
-    def _idx_path(self, session_id: str = ""):
-        return self.meta_dir / f"{session_id or self._session_id}.json"
+    @staticmethod
+    def _safe_sid(session_id: str) -> str:
+        """Map a session id to an injective, traversal-safe filename stem.
 
-    def _load_idx(self, session_id: str = ""):
-        ip = self._idx_path(session_id or self._session_id)
+        A readable prefix of the slugged id aids debugging; a hash suffix
+        guarantees distinct ids never collide onto one index file."""
+        sid = session_id or "unknown"
+        slug = "".join(c if c.isalnum() or c in "-_" else "_" for c in sid)[:32]
+        digest = hashlib.sha256(sid.encode("utf-8")).hexdigest()[:12]
+        return f"{slug}-{digest}"
+
+    def _idx_path(self, session_id: str):
+        return self.meta_dir / f"{self._safe_sid(session_id)}.json"
+
+    def _load_idx(self, session_id: str):
+        ip = self._idx_path(session_id)
         if ip.exists():
             try:
                 return json.loads(ip.read_text())
@@ -230,11 +306,10 @@ class BlobStore:
                 pass
         return {}
 
-    def _save_idx(self, idx: dict, session_id: str = ""):
-        # Atomic write: temp file + os.replace to prevent concurrent read
-        # of partial JSON from a different session thread.
-        import tempfile
-        target = self._idx_path(session_id or self._session_id)
+    def _save_idx(self, idx: dict, session_id: str):
+        # Atomic write: temp file + os.replace so a concurrent reader from
+        # another session thread never sees partial JSON.
+        target = self._idx_path(session_id)
         fd, tmp = tempfile.mkstemp(dir=target.parent, prefix=".tmp", suffix=".json")
         try:
             with os.fdopen(fd, "w") as f:

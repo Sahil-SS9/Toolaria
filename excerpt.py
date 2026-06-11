@@ -1,14 +1,13 @@
 """Content type detection and excerpt builders for Toolaria."""
+import functools
 import json
 import re
 
-_ERROR_RE = None
 
-def _err_re(patterns):
-    global _ERROR_RE
-    if _ERROR_RE is None:
-        _ERROR_RE = re.compile("|".join(re.escape(p) for p in patterns), re.I)
-    return _ERROR_RE
+@functools.lru_cache(maxsize=8)
+def _err_re(patterns: tuple):
+    # Keyed by the pattern tuple so a config change takes effect.
+    return re.compile("|".join(re.escape(p) for p in patterns), re.I)
 
 
 def detect_type(raw: str):
@@ -95,7 +94,10 @@ def build_excerpt(raw: str, kind: str, cfg: dict):
             parts = [f"[JSON excerpt — {kind_desc(raw, obj)}]"]
             parts.append("--- head ---")
             parts.append(head)
-            if len(lines) > head_n * 4:
+            # Show the tail only when the container has more items than the
+            # head and tail together already cover.
+            n_items = len(obj) if isinstance(obj, (list, dict)) else 0
+            if n_items > head_n + tail_n:
                 parts.append("--- tail ---")
                 parts.append(tail)
             # Error lines
@@ -111,7 +113,7 @@ def build_excerpt(raw: str, kind: str, cfg: dict):
     kind_label = {"text": "text", "code": "code", "html": "HTML"}.get(kind, kind)
     parts = [f"[{kind_label} excerpt]"]
     if len(lines) <= hl + tl:
-        parts.append(raw[:8000])
+        parts.append(raw[:cfg.get("excerpt_max_chars", 8000)])
     else:
         parts.append("--- head ---")
         parts.append("\n".join(lines[:hl]))
@@ -127,7 +129,7 @@ def build_excerpt(raw: str, kind: str, cfg: dict):
 def _error_lines(lines, patterns):
     if not patterns:
         return []
-    lp = _err_re(patterns)
+    lp = _err_re(tuple(patterns))
     return [l[:500] for l in lines if lp.search(l)][:20]
 
 

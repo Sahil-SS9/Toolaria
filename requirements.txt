@@ -1,0 +1,6 @@
+# PyYAML is used for config loading.
+PyYAML>=6.0
+# regex gives grep a mid-search timeout, the only safe way to run arbitrary
+# user patterns against blob content. Without it, grep falls back to literal
+# substring search and refuses metacharacter patterns.
+regex>=2024.0.0

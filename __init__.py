@@ -9,17 +9,15 @@ Explicit allow-list enforced — only rescued tools get intercepted.
 """
 from __future__ import annotations
 
-import json
 import logging
 import os
-import re
 from pathlib import Path
 
 try:
-    from .blobstore import BlobStore
+    from .blobstore import BlobStore, _BLOB_ID_RE
     from .excerpt import detect_type, build_excerpt
 except ImportError:
-    from blobstore import BlobStore  # type: ignore[no-redef]
+    from blobstore import BlobStore, _BLOB_ID_RE  # type: ignore[no-redef]
     from excerpt import detect_type, build_excerpt  # type: ignore[no-redef]
 
 logger = logging.getLogger(__name__)
@@ -27,14 +25,8 @@ logger = logging.getLogger(__name__)
 _store: BlobStore | None = None
 _cfg: dict = {}
 
-# Tools whose results may exceed context — the only tools rescued.
-# Terminal output and file reads are truncated by tools/tool_output_limits.py
-# before any hook fires.  delegate_task, session_search, etc. are explicitly
-# excluded as their results are bounded by design.
-#
-# Static set covers built-in tools; MCP tools are detected dynamically via
-# registry.get_toolset_for_tool() — any tool registered under an 'mcp-*'
-# toolset is automatically rescuer-eligible.
+# Tools whose results may exceed context — the only built-ins rescued.
+# MCP tools are detected dynamically via the registry toolset prefix.
 _RESCUABLE_TOOLS: set[str] = {
     "web_extract",
     "web_search",
@@ -44,10 +36,9 @@ _RESCUABLE_TOOLS: set[str] = {
     "browser_get_images",
 }
 
-
-# Hardcoded safety net — tools that must never be intercepted, regardless of
-# registry availability or config state. Checked unconditionally in _on_transform
-# so even a fail-open _is_rescuable() + empty config can't touch these.
+# Single source of truth for tools that must never be intercepted.
+# Enforced unconditionally in _on_transform, so _is_rescuable failing open
+# (registry import broken) still cannot touch these.
 _UNCONDITIONAL_EXCLUDES: frozenset[str] = frozenset({
     "rescuer_fetch", "delegate_task", "session_search",
     "cronjob", "skill_view", "skill_manage", "skill_request",
@@ -56,10 +47,10 @@ _UNCONDITIONAL_EXCLUDES: frozenset[str] = frozenset({
 
 
 def _is_rescuable(tool_name: str) -> bool:
-    """Return True if this tool should be rescued.  MCP tools are identified
-    via their dynamic 'mcp-{server}' toolset prefix; built-in web/browser
-    tools are matched by static name set.  Fails open (True) if the registry
-    import breaks."""
+    """True if this tool should be rescued.  MCP tools are identified via
+    their 'mcp-{server}' toolset prefix; built-in web/browser tools by the
+    static set.  Fails open (True) if the registry import breaks; the
+    unconditional excludes in _on_transform bound the blast radius."""
     if tool_name in _RESCUABLE_TOOLS:
         return True
     try:
@@ -68,10 +59,8 @@ def _is_rescuable(tool_name: str) -> bool:
         if toolset and toolset.startswith("mcp-"):
             return True
     except Exception:
-        return True  # fail open — safer to rescue than to flood context
+        return True  # fail open: safer to rescue than to flood context
     return False
-
-_BLOB_ID_RE = re.compile(r"^[0-9a-f]{12}$")
 
 
 def _safe_cfg(ctx) -> dict:
@@ -93,7 +82,7 @@ def _safe_cfg(ctx) -> dict:
         pass
     return {}
 
-# Load plugin-local config.yaml as defaults layer (overridden by main config)
+
 _CWD = Path(__file__).resolve().parent
 _LOCAL_CFG = _CWD / "config.yaml"
 
@@ -115,36 +104,20 @@ def _merge_cfg(user_cfg: dict) -> dict:
     return defaults
 
 
-def _session_id(ctx) -> str:
-    try:
-        return ctx.session_id or "unknown"
-    except Exception:
-        return os.environ.get("HERMES_SESSION_ID", "unknown")
-
-
 def register(ctx) -> None:
     global _store, _cfg
     _cfg = _merge_cfg(_safe_cfg(ctx))
-    # Add rescuer_fetch + hardcoded safety excludes to stop fail-open rescuing
-    # tools that must never be intercepted (delegate_task, session_search, etc.).
-    # These protect against _is_rescuable() returning True when registry import
-    # breaks — the exclude check runs after _is_rescuable, so pre-populating
-    # guarantee-unconditional default excludes makes the fail-open safe.
-    _DEFAULT_EXCLUDES = {
-        "rescuer_fetch", "delegate_task", "session_search",
-        "cronjob", "skill_view", "skill_manage", "skill_request",
-        "kanban_create", "open_kanban", "clarify", "memory",
-    }
-    _cfg.setdefault("exclude_tools", [])
-    for t in _DEFAULT_EXCLUDES:
-        if t not in _cfg["exclude_tools"]:
-            _cfg["exclude_tools"].append(t)
+    # Copy rather than mutate the caller's list in place.
+    excludes = list(_cfg.get("exclude_tools", []))
+    for t in _UNCONDITIONAL_EXCLUDES:
+        if t not in excludes:
+            excludes.append(t)
+    _cfg["exclude_tools"] = excludes
     try:
-        sid = _session_id(ctx)
-        _store = BlobStore(_cfg, sid)
+        _store = BlobStore(_cfg)
         _store.lazy_sweep()
     except Exception as e:
-        logger.warning("toolaria: blob init failed: %s", e)
+        logger.warning("toolaria: blob store init failed, rescuing disabled: %s", e)
         _store = None
 
     ctx.register_hook("transform_tool_result", _on_transform)
@@ -210,61 +183,78 @@ def _on_transform(
     **kwargs,
 ):
     """Replace oversized tool results with excerpt + rescue handle."""
-    # Only rescue MCP/web tools (dynamic allow-list with toolset check)
     if not _is_rescuable(tool_name):
-        return None
-    # Hardcoded unconditional excludes — must never be intercepted regardless
-    # of registry availability or config state (fail-open safety).
-    if tool_name in _UNCONDITIONAL_EXCLUDES:
         return None
     if tool_name in _cfg.get("exclude_tools", []):
         return None
     if not result or not isinstance(result, str):
         return None
+    if _store is None:
+        # No durable storage means no handle can be honoured; pass the
+        # result through untouched rather than destroy content.
+        return None
 
     try:
-        if len(result) > _cfg.get("max_result_chars", 8000):
+        if len(result) > _cfg.get("max_result_chars", 12000):
             return _rescue(result, tool_name, session_id=session_id)
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.warning("toolaria: rescue failed for %s: %s", tool_name, exc)
     return None
 
 
-def _rescue(result: str, tool_name: str, session_id: str = "") -> str:
-    blob_id = _store.put(result, tool_name, session_id=session_id) if _store else "NO_STORE"
+def _rescue(result: str, tool_name: str, session_id: str = "") -> str | None:
+    """Store the result and build the excerpt + handle block.
+
+    Returns None (leave the original untouched) unless the blob is durably
+    on disk; a handle that cannot be fetched is worse than no rescue."""
+    try:
+        blob_id = _store.put(result, tool_name, session_id=session_id)
+    except Exception as exc:
+        logger.warning("toolaria: blob write failed for %s: %s", tool_name, exc)
+        return None
+
     kind, meta = detect_type(result)
     excerpt = build_excerpt(result, kind, _cfg)
-    handle = (
-        "[Rescued: full result preserved]\n"
-        f"id: {blob_id}\n"
-        f"original: {len(result):,} chars, type: {kind} {meta}\n"
-        f"fetch: rescuer_fetch(id=\"{blob_id}\", mode=\"range\", start=0, count=20)\n"
-        f"       rescuer_fetch(id=\"{blob_id}\", mode=\"grep\", pattern=\"<term>\")"
+    n_lines = result.count("\n") + 1
+    head_lines = _cfg.get("head_lines", 40)
+    tail_lines = _cfg.get("tail_lines", 15)
+    return (
+        f"[Toolaria: tool result rescued. tool={tool_name}; "
+        f"size={len(result):,} chars; lines={n_lines:,}; "
+        f"type={kind} {meta}; blob={blob_id}]\n"
+        f"Preview (first {head_lines} / last {tail_lines} lines); "
+        f"this is a preview, NOT the full output:\n"
+        f"{excerpt}\n"
+        f"Use rescuer_fetch(id=\"{blob_id}\", mode=\"range\"|\"grep\"|"
+        f"\"stat\"|\"full\") for the rest, e.g. "
+        f"rescuer_fetch(id=\"{blob_id}\", mode=\"grep\", pattern=\"<term>\")"
     )
-    return excerpt + "\n\n" + handle
 
 
 def _on_start(session_id="", **kwargs):
     if _store:
         try:
             _store.lazy_sweep()
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("toolaria: sweep failed on session start: %s", exc)
 
 
 def _on_end(**kwargs):
     if _store:
         try:
             _store.lazy_sweep()
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("toolaria: sweep failed on session end: %s", exc)
 
 
 # ── tool handler ─────────────────────────────────────────────────────────
 
 
 def _fetch(args: dict | None = None, **kwargs) -> str:
-    """Handle rescuer_fetch tool calls — dispatched by plugin tool registry."""
+    """Handle rescuer_fetch tool calls — dispatched by plugin tool registry.
+
+    Reads session_id from kwargs when the dispatch layer forwards it; the
+    store falls back to an all-session metadata search otherwise."""
     if args is None:
         args = {}
     if not _store:
@@ -275,19 +265,13 @@ def _fetch(args: dict | None = None, **kwargs) -> str:
     start = int(args.get("start", 0))
     count = int(args.get("count", 20))
     pattern = args.get("pattern", "")
-    cap = _cfg.get("fetch_max_chars", 4000)
-
-    if mode == "full" and _cfg.get("refuse_full_fetch", True):
-        return (
-            "Refused: original exceeds safe inline size. "
-            "Use mode='range' or mode='grep' instead."
-        )
+    session_id = kwargs.get("session_id", "")
 
     if not _BLOB_ID_RE.match(bid):
-        return f"Error: invalid blob id '{bid}' — expected 12 hex chars"
+        return f"Error: invalid blob id '{bid}' (expected 12 hex chars)"
 
     return _store.fetch(bid, mode, start=start, count=count,
-                        pattern=pattern, cap=cap)
+                        pattern=pattern, session_id=session_id)
 
 
 # ── slash command ────────────────────────────────────────────────────────
