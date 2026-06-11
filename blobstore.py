@@ -12,10 +12,14 @@ try:
     from .excerpt import detect_type as _detect_type
     from .index import build_outline as _struct_outline
     from .index import render_outline as _render_outline
+    from .chunking import chunk_lines as _chunk_lines
+    from . import semantic as _sem
 except ImportError:
     from excerpt import detect_type as _detect_type  # type: ignore[no-redef]
     from index import build_outline as _struct_outline  # type: ignore[no-redef]
     from index import render_outline as _render_outline  # type: ignore[no-redef]
+    from chunking import chunk_lines as _chunk_lines  # type: ignore[no-redef]
+    import semantic as _sem  # type: ignore[no-redef]
 
 _LOCK = threading.Lock()
 _BLOB_ID_RE = re.compile(r"^[0-9a-f]{12}$")
@@ -72,7 +76,9 @@ class BlobStore:
         p = self.sidecar_path(blob_id, suffix)
         if p is None:
             return
-        fd, tmp = tempfile.mkstemp(dir=p.parent, prefix=".tmp", suffix=".json")
+        # Prefix the temp with the blob id so an orphan from a crash between
+        # mkstemp and replace is still caught by delete_sidecars' glob.
+        fd, tmp = tempfile.mkstemp(dir=p.parent, prefix=f"{blob_id}.tmp", suffix=".json")
         try:
             with os.fdopen(fd, "w") as f:
                 json.dump(data, f)
@@ -113,6 +119,79 @@ class BlobStore:
         if cached is None:
             cached = self.build_outline(blob_id, text)
         return _render_outline(cached)
+
+    # ── semantic search ──
+
+    def _chunks(self, blob_id: str, text: str) -> tuple[list[dict], bool]:
+        """Line-aligned chunks for a blob, cached as a sidecar.
+        Returns (chunks, truncated) where truncated means the blob was larger
+        than search_max_chunks chunks and only the head was indexed."""
+        cached = self.read_sidecar(blob_id, "chunks")
+        if cached is not None:
+            return cached.get("chunks", []), cached.get("truncated", False)
+        target = self.cfg.get("search_chunk_chars", 1200)
+        overlap = self.cfg.get("search_chunk_overlap_lines", 2)
+        max_chunks = self.cfg.get("search_max_chunks", 400)
+        # Cap per-chunk text so a single huge line cannot hand a giant string
+        # to the embedder; range/grep still reach the full line in the blob.
+        text_cap = target * 4
+        chunks = []
+        for c in _chunk_lines(text, target, overlap):
+            d = c.as_dict()
+            d["text"] = d["text"][:text_cap]
+            chunks.append(d)
+        truncated = len(chunks) > max_chunks
+        chunks = chunks[:max_chunks]
+        self.write_sidecar(blob_id, "chunks", {"chunks": chunks, "truncated": truncated})
+        return chunks, truncated
+
+    def _chunk_vectors(self, blob_id: str, chunks: list[dict],
+                       model_name: str) -> list[list[float]] | None:
+        """Embeddings for a blob's chunks, cached and keyed by model name.
+        None when embeddings are unavailable."""
+        if not _sem.embeddings_available():
+            return None
+        cached = self.read_sidecar(blob_id, "vectors")
+        if cached and cached.get("model") == model_name \
+                and len(cached.get("vectors", [])) == len(chunks):
+            return cached["vectors"]
+        vectors = _sem.embed([c["text"] for c in chunks], model_name)
+        if vectors is None:
+            return None
+        self.write_sidecar(blob_id, "vectors",
+                           {"model": model_name, "vectors": vectors})
+        return vectors
+
+    def search(self, blob_id: str, query: str, text: str) -> str:
+        if not query:
+            return "Error: search requires query=..."
+        chunks, truncated = self._chunks(blob_id, text)
+        if not chunks:
+            return "[search: blob is empty]"
+        top_k = int(self.cfg.get("search_top_k", 5))
+        snippet = int(self.cfg.get("search_snippet_chars", 400))
+        model_name = self.cfg.get("embedding_model", "all-MiniLM-L6-v2")
+        trunc_note = ("" if not truncated else
+                      " [note: blob too large to fully index; only the head "
+                      "was searched, use grep/range for the rest]")
+
+        vectors = self._chunk_vectors(blob_id, chunks, model_name)
+        method, ranked = _sem.rank(
+            [c["text"] for c in chunks], vectors, query, model_name, top_k,
+        )
+        if not ranked:
+            return f"[search ({method}): no matches for '{query}']{trunc_note}"
+
+        out = [f"[search ({method}) top {len(ranked)} for '{query}'; "
+               f"line numbers for rescuer_fetch range mode]{trunc_note}"]
+        for idx, score in ranked:
+            c = chunks[idx]
+            body = c["text"][:snippet]
+            out.append(
+                f"--- score {score:.3f}  lines {c['start_line']}..{c['end_line']} ---\n"
+                f"{body}"
+            )
+        return "\n".join(out)
 
     # ── blob i/o ──────────────────────────
 
@@ -204,8 +283,9 @@ class BlobStore:
         return tomb if include_swept else {}
 
     def fetch(self, blob_id: str, mode: str, start=0, count=20,
-              pattern=None, session_id: str = ""):
-        """Retrieve a slice of a blob. Modes: range, grep, stat, full."""
+              pattern=None, query=None, session_id: str = ""):
+        """Retrieve a slice of a blob.
+        Modes: outline, search, range, grep, stat, full."""
         if not _BLOB_ID_RE.match(blob_id):
             return f"Error: invalid blob id '{blob_id}' (expected 12 hex chars)"
 
@@ -242,6 +322,9 @@ class BlobStore:
 
         if mode == "outline":
             return self._outline(blob_id, text)
+
+        if mode == "search":
+            return self.search(blob_id, query or "", text)
 
         if mode == "full":
             max_full = self.cfg.get("full_fetch_max_chars", 50000)

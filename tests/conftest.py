@@ -77,6 +77,10 @@ def base_cfg(tmp_path):
         "ttl_hours": 1, "tombstone_ttl_hours": 720, "max_store_mb": 50,
         "store_path": str(tmp_path / "store"),
         "exclude_tools": [], "refuse_full_fetch": True,
+        "search_chunk_chars": 300, "search_chunk_overlap_lines": 1,
+        "search_max_chunks": 400, "search_top_k": 3,
+        "search_snippet_chars": 300,
+        "embedding_model": "all-MiniLM-L6-v2",
     }
 
 

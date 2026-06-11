@@ -128,8 +128,9 @@ def register(ctx) -> None:
         name="rescuer_fetch",
         toolset="rescuer",
         description=(
-            "Fetch slices of a rescued oversized tool result. "
-            "Modes: outline | range(start,count) | grep(pattern) | stat | full"
+            "Fetch slices of a rescued oversized tool result. Modes: "
+            "outline | search(query) | range(start,count) | grep(pattern) | "
+            "stat | full"
         ),
         handler=_fetch,
         schema={
@@ -144,7 +145,8 @@ def register(ctx) -> None:
                     },
                     "mode": {
                         "type": "string",
-                        "enum": ["range", "grep", "stat", "full", "outline"],
+                        "enum": ["outline", "search", "range", "grep",
+                                 "stat", "full"],
                         "description": "Retrieval mode (default: stat)",
                     },
                     "start": {
@@ -158,6 +160,10 @@ def register(ctx) -> None:
                     "pattern": {
                         "type": "string",
                         "description": "Regex for grep mode",
+                    },
+                    "query": {
+                        "type": "string",
+                        "description": "Natural-language query for search mode",
                     },
                 },
                 "required": ["id"],
@@ -233,6 +239,7 @@ def _rescue(result: str, tool_name: str, session_id: str = "") -> str | None:
         f"{excerpt}\n"
         f"Retrieve more with rescuer_fetch(id=\"{blob_id}\", mode=...):\n"
         f"  outline  structural map (sections / JSON schema / error clusters)\n"
+        f"  search   find by meaning, e.g. mode=\"search\", query=\"<question>\"\n"
         f"  grep     regex match, e.g. mode=\"grep\", pattern=\"<term>\"\n"
         f"  range    lines, e.g. mode=\"range\", start=0, count=20\n"
         f"  stat | full"
@@ -270,16 +277,20 @@ def _fetch(args: dict | None = None, **kwargs) -> str:
 
     bid = args.get("id", "")
     mode = args.get("mode", "stat")
-    start = int(args.get("start", 0))
-    count = int(args.get("count", 20))
+    try:
+        start = int(args.get("start", 0))
+        count = int(args.get("count", 20))
+    except (TypeError, ValueError):
+        return "Error: start and count must be integers"
     pattern = args.get("pattern", "")
+    query = args.get("query", "")
     session_id = kwargs.get("session_id", "")
 
     if not _BLOB_ID_RE.match(bid):
         return f"Error: invalid blob id '{bid}' (expected 12 hex chars)"
 
     return _store.fetch(bid, mode, start=start, count=count,
-                        pattern=pattern, session_id=session_id)
+                        pattern=pattern, query=query, session_id=session_id)
 
 
 # ── slash command ────────────────────────────────────────────────────────

@@ -19,3 +19,10 @@ toolaria:
   store_path: ~/.hermes/toolaria
   exclude_tools: []
   refuse_full_fetch: true         # refuse full mode over full_fetch_max_chars
+  # search mode (semantic / lexical retrieval over a rescued blob)
+  search_chunk_chars: 1200        # target size of each searchable chunk
+  search_chunk_overlap_lines: 2   # lines shared between adjacent chunks
+  search_max_chunks: 400          # cap on chunks indexed per blob
+  search_top_k: 5                 # hits returned per search
+  search_snippet_chars: 400       # chars shown per hit
+  embedding_model: all-MiniLM-L6-v2  # used when sentence-transformers is installed
