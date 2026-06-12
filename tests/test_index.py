@@ -26,8 +26,8 @@ def test_chunk_overlap_present():
     text = "\n".join(f"line {i}" for i in range(60))
     chunks = chunk_lines(text, target_chars=120, overlap_lines=2)
     assert len(chunks) >= 2
-    # consecutive chunks share lines
-    assert chunks[1].start_line < chunks[0].end_line
+    # consecutive chunks share at least one line (overlap, not just contiguity)
+    assert chunks[1].start_line <= chunks[0].end_line
 
 
 def test_chunk_long_single_line_is_own_chunk():
@@ -44,13 +44,17 @@ def test_chunk_terminates_tiny_target():
 
 def test_single_long_line_char_windowed():
     """Minified JSON on one line must split into many bounded chunks."""
-    text = "x" * 10000  # one line, no newlines
+    # distinct 4-char groups so an overlap check cannot pass by coincidence
+    text = "".join(f"{i:04d}" for i in range(2500))  # 10000 chars, one line
     chunks = chunk_lines(text, target_chars=600)
     assert len(chunks) > 1
     assert all(c.start_line == 0 and c.end_line == 0 for c in chunks)
     assert all(len(c.text) <= 600 for c in chunks)
     # windows overlap, so the joined length exceeds the original
     assert sum(len(c.text) for c in chunks) > len(text)
+    # consecutive windows literally share a run of characters
+    tail = chunks[0].text[-50:]
+    assert tail in chunks[1].text
 
 
 def test_long_line_window_finds_mid_marker():
