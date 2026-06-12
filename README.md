@@ -26,6 +26,49 @@ Beyond grep, a rescued blob becomes an **addressable, searchable scratch space**
 
 ---
 
+## Proof
+
+A real `web_extract` returning 2,000 transaction records, run through Toolaria:
+
+| Moment | Without Toolaria | With Toolaria |
+|---|---|---|
+| Tool returns a 171,874-char result | all 171,874 chars flood context | model sees a **1,733-char** handle (**99x smaller**) |
+| Model hands the result to a second tool | must read all 171,874 chars back in to pass them on | emits **79 chars** (`tla:<id>`); the tool receives the full 171,874 |
+| Model needs the failed payments | scroll/grep blind through 171k chars | `outline` then `search "failed"` returns the matching rows with line numbers |
+
+What the model actually sees when the result lands (truncated):
+
+```
+[Toolaria: tool result rescued. tool=web_extract; size=171,874 chars; lines=1; type=json array[2000]; blob=5ddff67d]
+Preview (first 6 / last 3 lines); this is a preview, NOT the full output:
+[JSON excerpt: array[2000]]
+--- head ---
+[ { "id": 0, "user": "user0", "amount": 0.0, "status": "failed", "note": "card declined insufficient funds" }, ... ]
+...
+To feed this whole result into another tool WITHOUT reading it, pass "tla:5ddff67d" as that tool's argument;
+Toolaria expands it to the full content before the tool runs.
+```
+
+`rescuer_fetch(mode="outline")` then turns the blob into a structural map without
+loading a single row, numeric columns summarised in place:
+
+```
+[JSON outline]
+root: array, length 2000
+elements: objects (sampled 1000):
+  - id (int)      [n=1000 min=0 max=999 mean=499.5]
+  - user (str)
+  - amount (float) [n=1000 min=0.0 max=497.0 mean=244.35]
+  - status (str)
+  - note (str)
+```
+
+Reproduce it yourself: the numbers above come from the test fixtures and the
+end-to-end stress suite (`tests/`), which also cover cross-session denial,
+ReDoS-bounded grep, size-cap eviction, and single-line (minified JSON) search.
+
+---
+
 ## 60-second Quickstart
 
 ```bash
