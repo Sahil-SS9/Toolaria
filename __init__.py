@@ -16,9 +16,11 @@ from pathlib import Path
 try:
     from .blobstore import BlobStore, _BLOB_ID_RE
     from .excerpt import detect_type, build_excerpt
+    from .passref import make_middleware as _make_passref_mw
 except ImportError:
     from blobstore import BlobStore, _BLOB_ID_RE  # type: ignore[no-redef]
     from excerpt import detect_type, build_excerpt  # type: ignore[no-redef]
+    from passref import make_middleware as _make_passref_mw  # type: ignore[no-redef]
 
 logger = logging.getLogger(__name__)
 
@@ -124,12 +126,24 @@ def register(ctx) -> None:
     ctx.register_hook("on_session_start", _on_start)
     ctx.register_hook("on_session_end", _on_end)
 
+    # Pass-by-reference: expand tla:<id> tokens in downstream tool args into
+    # full blob content before the tool runs, so a rescued result can flow
+    # tool to tool without ever re-entering the model's context. Always
+    # registered when the host supports middleware; passref_enabled is the
+    # single live on/off check, inside the callback.
+    if hasattr(ctx, "register_middleware"):
+        ctx.register_middleware(
+            "tool_request",
+            _make_passref_mw(lambda: _store, _cfg, _UNCONDITIONAL_EXCLUDES),
+        )
+
     ctx.register_tool(
         name="rescuer_fetch",
         toolset="rescuer",
         description=(
-            "Fetch slices of a rescued oversized tool result. "
-            "Modes: range(start,count) | grep(pattern) | stat | full"
+            "Fetch slices of a rescued oversized tool result. Modes: "
+            "outline | search(query) | range(start,count) | grep(pattern) | "
+            "stat | full"
         ),
         handler=_fetch,
         schema={
@@ -144,7 +158,8 @@ def register(ctx) -> None:
                     },
                     "mode": {
                         "type": "string",
-                        "enum": ["range", "grep", "stat", "full"],
+                        "enum": ["outline", "search", "range", "grep",
+                                 "stat", "full"],
                         "description": "Retrieval mode (default: stat)",
                     },
                     "start": {
@@ -158,6 +173,10 @@ def register(ctx) -> None:
                     "pattern": {
                         "type": "string",
                         "description": "Regex for grep mode",
+                    },
+                    "query": {
+                        "type": "string",
+                        "description": "Natural-language query for search mode",
                     },
                 },
                 "required": ["id"],
@@ -215,6 +234,12 @@ def _rescue(result: str, tool_name: str, session_id: str = "") -> str | None:
 
     kind, meta = detect_type(result)
     excerpt = build_excerpt(result, kind, _cfg)
+    # Structural outline is cheap and deterministic; build it now so the
+    # model can navigate by structure on its first fetch.
+    try:
+        _store.build_outline(blob_id, result)
+    except Exception as exc:
+        logger.debug("toolaria: outline build failed for %s: %s", blob_id, exc)
     n_lines = result.count("\n") + 1
     head_lines = _cfg.get("head_lines", 40)
     tail_lines = _cfg.get("tail_lines", 15)
@@ -225,9 +250,15 @@ def _rescue(result: str, tool_name: str, session_id: str = "") -> str | None:
         f"Preview (first {head_lines} / last {tail_lines} lines); "
         f"this is a preview, NOT the full output:\n"
         f"{excerpt}\n"
-        f"Use rescuer_fetch(id=\"{blob_id}\", mode=\"range\"|\"grep\"|"
-        f"\"stat\"|\"full\") for the rest, e.g. "
-        f"rescuer_fetch(id=\"{blob_id}\", mode=\"grep\", pattern=\"<term>\")"
+        f"Retrieve more with rescuer_fetch(id=\"{blob_id}\", mode=...):\n"
+        f"  outline  structural map (sections / JSON schema / error clusters)\n"
+        f"  search   find by meaning, e.g. mode=\"search\", query=\"<question>\"\n"
+        f"  grep     regex match, e.g. mode=\"grep\", pattern=\"<term>\"\n"
+        f"  range    lines, e.g. mode=\"range\", start=0, count=20\n"
+        f"  stat | full\n"
+        f"To feed this whole result into another tool WITHOUT reading it, pass "
+        f"\"tla:{blob_id}\" as that tool's argument; Toolaria expands it to the "
+        f"full content before the tool runs."
     )
 
 
@@ -262,16 +293,20 @@ def _fetch(args: dict | None = None, **kwargs) -> str:
 
     bid = args.get("id", "")
     mode = args.get("mode", "stat")
-    start = int(args.get("start", 0))
-    count = int(args.get("count", 20))
+    try:
+        start = int(args.get("start", 0))
+        count = int(args.get("count", 20))
+    except (TypeError, ValueError):
+        return "Error: start and count must be integers"
     pattern = args.get("pattern", "")
+    query = args.get("query", "")
     session_id = kwargs.get("session_id", "")
 
     if not _BLOB_ID_RE.match(bid):
         return f"Error: invalid blob id '{bid}' (expected 12 hex chars)"
 
     return _store.fetch(bid, mode, start=start, count=count,
-                        pattern=pattern, session_id=session_id)
+                        pattern=pattern, query=query, session_id=session_id)
 
 
 # ── slash command ────────────────────────────────────────────────────────

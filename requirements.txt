@@ -4,3 +4,8 @@ PyYAML>=6.0
 # user patterns against blob content. Without it, grep falls back to literal
 # substring search and refuses metacharacter patterns.
 regex>=2024.0.0
+
+# Optional extras (search works without them via BM25 lexical ranking):
+#   sentence-transformers  enables semantic search mode
+#   numpy                  speeds up the vector maths (pure-Python fallback otherwise)
+# Install with: pip install sentence-transformers numpy

@@ -7,10 +7,22 @@ Toolaria is the spill-to-disk pattern, packaged as a single-purpose, zero-config
 Hermes Agent plugin. When an MCP or web tool returns a result too large for the
 context window, Toolaria stores the full output in a SHA256-addressed blob store
 and hands the model a compact excerpt plus a fetch handle. The model retrieves
-only the slices it needs (`range`, `grep`, `stat`, or `full`) via `rescuer_fetch`.
+only the slices it needs via `rescuer_fetch`.
 
 It does one thing, it is on by default, and it composes with whatever context
 engine you run.
+
+Beyond grep, a rescued blob becomes an **addressable, searchable scratch space**:
+
+- **`outline`** gives the model a structural map (JSON schema with numeric
+  column stats, HTML heading hierarchy, log error clusters) so it navigates by
+  structure instead of guessing search terms.
+- **`search`** runs semantic (or dep-free lexical) retrieval over the blob:
+  ask in plain language, get the most relevant chunks with line numbers.
+- **Pass-by-reference** lets the model hand a whole result to another tool
+  without reading it: write `tla:<id>` as a downstream tool's argument and
+  Toolaria expands it to the full content before that tool runs, so a 200k
+  result flows tool to tool and never re-enters the context window.
 
 ---
 
@@ -117,6 +129,16 @@ All keys in `config.yaml` with defaults:
 | `grep_max_line_len` | `2000` | Per-line slice searched by grep |
 | `refuse_full_fetch` | `true` | Refuse `full` over `full_fetch_max_chars` |
 | `exclude_tools` | `[]` | Additional tools never intercepted (hardcoded defaults always apply) |
+| `search_chunk_chars` | `1200` | Target size of each searchable chunk |
+| `search_chunk_overlap_lines` | `2` | Lines shared between adjacent chunks |
+| `search_max_chunks` | `400` | Cap on chunks indexed per blob |
+| `search_top_k` | `5` | Hits returned per search |
+| `search_snippet_chars` | `400` | Characters shown per hit |
+| `embedding_model` | `all-MiniLM-L6-v2` | Used when `sentence-transformers` is installed |
+| `passref_enabled` | `true` | Enable `tla:<id>` pass-by-reference expansion |
+| `passref_max_chars` | `500000` | Cap on content expanded per token |
+| `passref_total_max_chars` | `2000000` | Cap on total expansion per tool call |
+| `passref_allowed_tools` | `[]` | Strict allowlist; empty means all but exec/exfil sinks |
 
 ---
 
@@ -145,6 +167,8 @@ The model-facing tool to retrieve slices of a rescued result.
 
 | Mode | Required params | Description |
 |---|---|---|
+| `outline` | `id` | Structural map: JSON schema with numeric stats, HTML headings, log error clusters |
+| `search` | `id`, `query` | Semantic (or lexical) retrieval; top chunks with line numbers |
 | `stat` | `id` | Blob metadata (size, tool, timestamp) |
 | `range` | `id`, `start`, `count` | Lines `start` to `start+count`; the response echoes the line range and total |
 | `grep` | `id`, `pattern` | Regex match within the blob, with line numbers |
@@ -154,15 +178,51 @@ If a blob has been swept after its retention window, `rescuer_fetch` returns a
 short message naming the source tool and advising the model to re-run it, rather
 than a bare error.
 
+## Pass-by-reference
+
+A rescued result can be handed to another tool without the model reading it.
+The rescue handle tells the model: to feed the whole result into a downstream
+tool, pass `tla:<id>` as that tool's argument. A `tool_request` middleware
+expands the token into the blob's full content before the tool executes, so the
+payload flows tool to tool and never re-enters the context window.
+
+Because the expanded content bypasses the context (and therefore any review of
+model-emitted args), expansion is **denied by default for exec and exfil sinks**
+(shell, exec, file-write, http-post, and similar). For security-sensitive
+setups, set `passref_allowed_tools` to a strict allowlist. Per-token and
+per-call size caps bound how much content one tool call can pull in.
+
 ---
 
 ## Limitations
 
-- **Round-trip blindness.** The model only sees the excerpt inline. Anything the
-  excerpt heuristics drop is invisible unless the model fetches it, and the model
-  cannot pass the full payload to another tool without fetching it first. This is
-  inherent to the spill-to-disk pattern; the handle's explicit preview warning is
-  the mitigation.
+- **Round-trip blindness, mostly addressed.** The model only sees the excerpt
+  inline, so anything the excerpt heuristics drop is invisible unless it fetches
+  it. The classic version of this failure, the model being unable to pass full
+  content to another tool, is what pass-by-reference solves. The residue is that
+  the excerpt itself is still a preview; the handle says so explicitly, and
+  `outline`/`search` give the model better ways to find what it needs.
+- **Search needs `sentence-transformers` for semantics.** Without it, `search`
+  falls back to BM25 lexical ranking (dep-free, still useful). The embedding
+  model downloads lazily on first semantic search. `numpy` is used for the
+  vector maths when present, with a pure-Python fallback otherwise.
+- **Single-line blobs search by character window.** Minified JSON and other
+  payloads on one line are chunked into overlapping character windows so search
+  still localises a hit, but every window reports the same line number. On such
+  blobs a search hit narrows the content, not a `range` line span; use `grep` or
+  a wider `range` to pull the surrounding bytes.
+- **Pass-by-reference lands silently.** Expanded content reaches a tool without
+  appearing in context, so it also bypasses any human or filter inspecting
+  model-emitted args. Exec/exfil sinks are denied by default and a strict
+  allowlist is available. Expansion is session-scoped when the host forwards a
+  `session_id`: a token for a blob the calling session does not reference is
+  refused, so cross-session expansion of a guessed id is no longer served. When
+  no `session_id` is forwarded (vanilla Hermes), expansion falls back to the
+  global content-addressed read so single-session setups still work.
+- **Store cap is approximate.** `max_store_mb` now counts each blob's file
+  bytes plus its per-blob sidecars (outline, chunks, vectors), since eviction
+  frees both. It remains approximate: the cap is enforced at sweep time, not on
+  every write, so usage can briefly exceed it between sweeps.
 - **Swept content is gone.** After `ttl_hours` (or size eviction) the blob file
   is deleted. A later fetch returns re-run guidance, not the content. Handles
   embedded in old compaction summaries therefore degrade gracefully rather than

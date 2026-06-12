@@ -30,6 +30,7 @@ class FakeCtx:
         self.hooks = {}
         self.tools = {}
         self.commands = {}
+        self.middleware = {}
 
     @property
     def config(self):
@@ -37,6 +38,9 @@ class FakeCtx:
 
     def register_hook(self, name, fn):
         self.hooks[name] = fn
+
+    def register_middleware(self, kind, fn):
+        self.middleware.setdefault(kind, []).append(fn)
 
     def register_tool(self, name, toolset, schema, handler, **kw):
         self.tools[name] = {"handler": handler, "schema": schema}
@@ -77,6 +81,11 @@ def base_cfg(tmp_path):
         "ttl_hours": 1, "tombstone_ttl_hours": 720, "max_store_mb": 50,
         "store_path": str(tmp_path / "store"),
         "exclude_tools": [], "refuse_full_fetch": True,
+        "search_chunk_chars": 300, "search_chunk_overlap_lines": 1,
+        "search_max_chunks": 400, "search_top_k": 3,
+        "search_snippet_chars": 300,
+        "embedding_model": "all-MiniLM-L6-v2",
+        "passref_enabled": True, "passref_max_chars": 500000,
     }
 
 

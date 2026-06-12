@@ -227,6 +227,97 @@ def test_fetch_unknown_mode(plugin, toolaria):
     assert "unknown mode" in r
 
 
+def test_outline_mode_json(plugin, toolaria):
+    import json
+    rows = [{"id": i, "score": i * 1.5} for i in range(50)]
+    bid = toolaria._store.put(json.dumps(rows), "web_extract", session_id="test-s")
+    r = toolaria._fetch(args={"id": bid, "mode": "outline"}, session_id="test-s")
+    assert "JSON outline" in r
+    assert "score" in r and "min=" in r
+
+
+def test_search_mode_lexical(plugin, toolaria, monkeypatch):
+    """Lexical (BM25) search returns the relevant chunk with line numbers."""
+    monkeypatch.setattr(toolaria.blobstore._sem, "embeddings_available",
+                        lambda: False)
+    lines = (["intro paragraph about nothing"] * 20
+             + ["the secret password is hunter2"]
+             + ["more filler text here"] * 20)
+    bid = toolaria._store.put("\n".join(lines), "web_extract", session_id="test-s")
+    r = toolaria._fetch(args={"id": bid, "mode": "search", "query": "secret password"},
+                        session_id="test-s")
+    assert "lexical" in r
+    assert "hunter2" in r
+    assert "lines " in r  # hit carries a line range for range-mode follow-up
+
+
+def test_search_requires_query(plugin, toolaria, monkeypatch):
+    monkeypatch.setattr(toolaria.blobstore._sem, "embeddings_available",
+                        lambda: False)
+    bid = toolaria._store.put("a\nb\nc", "web_extract", session_id="test-s")
+    r = toolaria._fetch(args={"id": bid, "mode": "search"}, session_id="test-s")
+    assert "requires query" in r
+
+
+def test_search_caches_chunks(plugin, toolaria, monkeypatch):
+    monkeypatch.setattr(toolaria.blobstore._sem, "embeddings_available",
+                        lambda: False)
+    bid = toolaria._store.put("\n".join(f"row {i}" for i in range(50)),
+                              "web_extract", session_id="test-s")
+    toolaria._fetch(args={"id": bid, "mode": "search", "query": "row 7"},
+                    session_id="test-s")
+    assert toolaria._store.read_sidecar(bid, "chunks") is not None
+
+
+def test_search_semantic_with_stub(plugin, toolaria, monkeypatch):
+    """With embeddings present, search uses the semantic path and caches vectors."""
+    sem = toolaria.blobstore._sem
+
+    def stub_embed(texts, model):
+        # apple -> [1,0], banana -> [0,1], else -> [0,0]
+        out = []
+        for t in texts:
+            tl = t.lower()
+            out.append([1.0, 0.0] if "apple" in tl else
+                       [0.0, 1.0] if "banana" in tl else [0.0, 0.0])
+        return out
+
+    monkeypatch.setattr(sem, "embeddings_available", lambda: True)
+    monkeypatch.setattr(sem, "embed", stub_embed)
+
+    text = "line about apple pie\n" + ("filler\n" * 10) + "line about banana bread"
+    bid = toolaria._store.put(text, "web_extract", session_id="test-s")
+    r = toolaria._fetch(args={"id": bid, "mode": "search", "query": "banana"},
+                        session_id="test-s")
+    assert "semantic" in r
+    assert "banana" in r
+    cached = toolaria._store.read_sidecar(bid, "vectors")
+    assert cached is not None and cached["model"]
+
+
+def test_search_truncation_note(plugin, toolaria, monkeypatch):
+    """A blob larger than search_max_chunks is flagged as partially indexed."""
+    monkeypatch.setattr(toolaria.blobstore._sem, "embeddings_available",
+                        lambda: False)
+    toolaria._store.cfg["search_max_chunks"] = 3
+    big = "\n".join(f"line number {i} of content" for i in range(500))
+    bid = toolaria._store.put(big, "web_extract", session_id="test-s")
+    r = toolaria._fetch(args={"id": bid, "mode": "search", "query": "content"},
+                        session_id="test-s")
+    assert "too large to fully index" in r
+
+
+def test_outline_built_at_rescue(plugin, toolaria):
+    import json
+    raw = json.dumps([{"a": i, "label": f"row-{i}"} for i in range(1000)])
+    assert len(raw) > 8000  # over the rescue threshold
+    handle = toolaria._on_transform(tool_name="web_extract", result=raw)
+    assert "outline" in handle
+    bid = _parse_blob_id(handle)
+    # sidecar exists without a fetch having to build it
+    assert toolaria._store.read_sidecar(bid, "outline") is not None
+
+
 # ═══ Sweep ═══
 
 
@@ -267,6 +358,24 @@ def test_fetch_refreshes_blob_ttl(plugin, toolaria):
     r = toolaria._fetch(args={"id": bid, "mode": "range", "start": 0, "count": 1},
                         session_id="test-s")
     assert "Swept" not in r and "not found" not in r
+
+
+def test_sidecars_swept_with_blob(plugin, toolaria):
+    """Outline sidecars do not outlive their blob."""
+    import json, time as _t
+    raw = json.dumps([{"a": i} for i in range(1000)])
+    bid = toolaria._store.put(raw, "web_extract", session_id="test-s")
+    toolaria._store.build_outline(bid, raw)
+    assert toolaria._store.read_sidecar(bid, "outline") is not None
+    idx = toolaria._store._load_idx("test-s")
+    idx["blobs"][bid]["t"] = _t.time() - 7200
+    toolaria._store._save_idx(idx, "test-s")
+    toolaria._store.lazy_sweep()
+    assert toolaria._store.read_sidecar(bid, "outline") is None
+
+
+def test_sidecar_path_rejects_bad_id(plugin, toolaria):
+    assert toolaria._store.sidecar_path("../../etc/passwd", "outline") is None
 
 
 def test_swept_blob_leaves_tombstone(plugin, toolaria):
@@ -323,6 +432,28 @@ def test_size_sweep_also_tombstones(plugin, toolaria):
     assert not (toolaria._store.blob_dir / bid).exists()
     r = toolaria._fetch(args={"id": bid, "mode": "stat"}, session_id="test-s")
     assert "Swept" in r
+
+
+def test_size_sweep_counts_sidecar_bytes(plugin, toolaria):
+    """Blob file bytes fit under the cap, but blob + sidecars exceed it, so
+    eviction must still fire. Without counting sidecars the blob would survive."""
+    import json
+    raw = json.dumps([{"a": i, "label": f"row-{i}"} for i in range(1000)])
+    bid = toolaria._store.put(raw, "web_extract", session_id="test-s")
+    # Build outline + chunks sidecars; vectors are skipped (embeddings absent).
+    toolaria._store.build_outline(bid, raw)
+    toolaria._store._chunks(bid, raw)
+
+    blob_bytes = (toolaria._store.blob_dir / bid).stat().st_size
+    sidecar_bytes = toolaria._store._sidecar_bytes(bid)
+    assert sidecar_bytes > 0
+    # Cap sits between blob-only and blob+sidecar totals: blob alone fits.
+    cap_bytes = blob_bytes + sidecar_bytes // 2
+    toolaria._store.cfg["max_store_mb"] = cap_bytes / (1024 * 1024)
+
+    toolaria._store.lazy_sweep()
+    assert not (toolaria._store.blob_dir / bid).exists()
+    assert toolaria._store._sidecar_bytes(bid) == 0
 
 
 def test_session_id_slugged(plugin, toolaria):

@@ -8,6 +8,19 @@ import time
 import threading
 from pathlib import Path
 
+try:
+    from .excerpt import detect_type as _detect_type
+    from .index import build_outline as _struct_outline
+    from .index import render_outline as _render_outline
+    from .chunking import chunk_lines as _chunk_lines
+    from . import semantic as _sem
+except ImportError:
+    from excerpt import detect_type as _detect_type  # type: ignore[no-redef]
+    from index import build_outline as _struct_outline  # type: ignore[no-redef]
+    from index import render_outline as _render_outline  # type: ignore[no-redef]
+    from chunking import chunk_lines as _chunk_lines  # type: ignore[no-redef]
+    import semantic as _sem  # type: ignore[no-redef]
+
 _LOCK = threading.Lock()
 _BLOB_ID_RE = re.compile(r"^[0-9a-f]{12}$")
 
@@ -38,8 +51,147 @@ class BlobStore:
         bp = Path(cfg.get("store_path", "~/.hermes/toolaria")).expanduser().resolve()
         self.blob_dir = bp / "blobs"
         self.meta_dir = bp / "sessions"
+        self.sidecar_dir = bp / "sidecars"
         self.blob_dir.mkdir(parents=True, exist_ok=True)
         self.meta_dir.mkdir(parents=True, exist_ok=True)
+        self.sidecar_dir.mkdir(parents=True, exist_ok=True)
+
+    # ── sidecars (per-blob index/vector artefacts) ──
+
+    def sidecar_path(self, blob_id: str, suffix: str) -> Path | None:
+        if not _BLOB_ID_RE.match(blob_id):
+            return None
+        return self.sidecar_dir / f"{blob_id}.{suffix}.json"
+
+    def read_sidecar(self, blob_id: str, suffix: str):
+        p = self.sidecar_path(blob_id, suffix)
+        if p and p.exists():
+            try:
+                return json.loads(p.read_text())
+            except Exception:
+                return None
+        return None
+
+    def write_sidecar(self, blob_id: str, suffix: str, data) -> None:
+        p = self.sidecar_path(blob_id, suffix)
+        if p is None:
+            return
+        # Prefix the temp with the blob id so an orphan from a crash between
+        # mkstemp and replace is still caught by delete_sidecars' glob.
+        fd, tmp = tempfile.mkstemp(dir=p.parent, prefix=f"{blob_id}.tmp", suffix=".json")
+        try:
+            with os.fdopen(fd, "w") as f:
+                json.dump(data, f)
+            os.replace(tmp, p)
+        except Exception:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+
+    def delete_sidecars(self, blob_id: str) -> None:
+        for p in self.sidecar_dir.glob(f"{blob_id}.*.json"):
+            try:
+                p.unlink()
+            except OSError:
+                pass
+
+    def blob_text(self, blob_id: str) -> str | None:
+        """Decoded blob content, or None if missing or binary."""
+        bpath = self.blob_dir / blob_id
+        if not bpath.exists():
+            return None
+        try:
+            return bpath.read_bytes().decode("utf-8")
+        except (UnicodeDecodeError, OSError):
+            return None
+
+    def build_outline(self, blob_id: str, text: str) -> dict:
+        """Build and cache the structural outline for a blob (cheap, sync).
+        Safe to call at rescue time."""
+        kind, _ = _detect_type(text)
+        outline = _struct_outline(text, kind, self.cfg)
+        self.write_sidecar(blob_id, "outline", outline)
+        return outline
+
+    def _outline(self, blob_id: str, text: str) -> str:
+        cached = self.read_sidecar(blob_id, "outline")
+        if cached is None:
+            cached = self.build_outline(blob_id, text)
+        return _render_outline(cached)
+
+    # ── semantic search ──
+
+    def _chunks(self, blob_id: str, text: str) -> tuple[list[dict], bool]:
+        """Line-aligned chunks for a blob, cached as a sidecar.
+        Returns (chunks, truncated) where truncated means the blob was larger
+        than search_max_chunks chunks and only the head was indexed."""
+        cached = self.read_sidecar(blob_id, "chunks")
+        if cached is not None:
+            return cached.get("chunks", []), cached.get("truncated", False)
+        target = self.cfg.get("search_chunk_chars", 1200)
+        overlap = self.cfg.get("search_chunk_overlap_lines", 2)
+        max_chunks = self.cfg.get("search_max_chunks", 400)
+        # Cap per-chunk text so a single huge line cannot hand a giant string
+        # to the embedder; range/grep still reach the full line in the blob.
+        text_cap = target * 4
+        chunks = []
+        for c in _chunk_lines(text, target, overlap):
+            d = c.as_dict()
+            d["text"] = d["text"][:text_cap]
+            chunks.append(d)
+        truncated = len(chunks) > max_chunks
+        chunks = chunks[:max_chunks]
+        self.write_sidecar(blob_id, "chunks", {"chunks": chunks, "truncated": truncated})
+        return chunks, truncated
+
+    def _chunk_vectors(self, blob_id: str, chunks: list[dict],
+                       model_name: str) -> list[list[float]] | None:
+        """Embeddings for a blob's chunks, cached and keyed by model name.
+        None when embeddings are unavailable."""
+        if not _sem.embeddings_available():
+            return None
+        cached = self.read_sidecar(blob_id, "vectors")
+        if cached and cached.get("model") == model_name \
+                and len(cached.get("vectors", [])) == len(chunks):
+            return cached["vectors"]
+        vectors = _sem.embed([c["text"] for c in chunks], model_name)
+        if vectors is None:
+            return None
+        self.write_sidecar(blob_id, "vectors",
+                           {"model": model_name, "vectors": vectors})
+        return vectors
+
+    def search(self, blob_id: str, query: str, text: str) -> str:
+        if not query:
+            return "Error: search requires query=..."
+        chunks, truncated = self._chunks(blob_id, text)
+        if not chunks:
+            return "[search: blob is empty]"
+        top_k = int(self.cfg.get("search_top_k", 5))
+        snippet = int(self.cfg.get("search_snippet_chars", 400))
+        model_name = self.cfg.get("embedding_model", "all-MiniLM-L6-v2")
+        trunc_note = ("" if not truncated else
+                      " [note: blob too large to fully index; only the head "
+                      "was searched, use grep/range for the rest]")
+
+        vectors = self._chunk_vectors(blob_id, chunks, model_name)
+        method, ranked = _sem.rank(
+            [c["text"] for c in chunks], vectors, query, model_name, top_k,
+        )
+        if not ranked:
+            return f"[search ({method}): no matches for '{query}']{trunc_note}"
+
+        out = [f"[search ({method}) top {len(ranked)} for '{query}'; "
+               f"line numbers for rescuer_fetch range mode]{trunc_note}"]
+        for idx, score in ranked:
+            c = chunks[idx]
+            body = c["text"][:snippet]
+            out.append(
+                f"--- score {score:.3f}  lines {c['start_line']}..{c['end_line']} ---\n"
+                f"{body}"
+            )
+        return "\n".join(out)
 
     # ── blob i/o ──────────────────────────
 
@@ -109,6 +261,19 @@ class BlobStore:
             f"to regenerate it."
         )
 
+    def session_references(self, blob_id: str, session_id: str) -> bool:
+        """True if *session_id*'s index holds a LIVE (non-tombstone) entry for
+        the blob.
+
+        Pass-by-reference uses this to confine expansion to the calling
+        session: blobs are content-addressed and shared, so a global read
+        would let one session expand another's blob by guessing a 12-hex id."""
+        if not session_id:
+            return False
+        entry = self._read_idx_file(self._idx_path(session_id)) \
+            .get("blobs", {}).get(blob_id)
+        return bool(entry) and "swept_at" not in entry
+
     def _find_meta(self, blob_id: str, session_id: str = "",
                    include_swept: bool = False) -> dict:
         """Index metadata for a blob: the given session's entry, or the first
@@ -131,8 +296,9 @@ class BlobStore:
         return tomb if include_swept else {}
 
     def fetch(self, blob_id: str, mode: str, start=0, count=20,
-              pattern=None, session_id: str = ""):
-        """Retrieve a slice of a blob. Modes: range, grep, stat, full."""
+              pattern=None, query=None, session_id: str = ""):
+        """Retrieve a slice of a blob.
+        Modes: outline, search, range, grep, stat, full."""
         if not _BLOB_ID_RE.match(blob_id):
             return f"Error: invalid blob id '{blob_id}' (expected 12 hex chars)"
 
@@ -166,6 +332,12 @@ class BlobStore:
             text = raw.decode("utf-8")
         except UnicodeDecodeError:
             return f"Error: blob {blob_id} is binary ({len(raw)} bytes)"
+
+        if mode == "outline":
+            return self._outline(blob_id, text)
+
+        if mode == "search":
+            return self.search(blob_id, query or "", text)
 
         if mode == "full":
             max_full = self.cfg.get("full_fetch_max_chars", 50000)
@@ -301,18 +473,34 @@ class BlobStore:
             if changed:
                 self._write_idx_file(ip, idx)
 
-        # Delete blob files no session holds a LIVE reference to.
+        # Delete blob files no session holds a LIVE reference to, along with
+        # their sidecar index/vector artefacts.
         for bf in self.blob_dir.iterdir():
             if bf.is_file() and _BLOB_ID_RE.match(bf.name):
                 if not self._any_live_refs(bf.name):
                     bf.unlink()
+                    self.delete_sidecars(bf.name)
+
+    def _sidecar_bytes(self, bid: str) -> int:
+        """On-disk bytes of a blob's sidecars. These are deleted with the blob
+        on eviction, so they count toward the store cap alongside it."""
+        total = 0
+        for p in self.sidecar_dir.glob(f"{bid}.*.json"):
+            try:
+                total += p.stat().st_size
+            except OSError:
+                pass
+        return total
 
     def _sweep_by_size(self, now, max_mb):
         max_bytes = max_mb * 1024 * 1024
         all_blobs = []
         for bf in self.blob_dir.iterdir():
             if bf.is_file() and _BLOB_ID_RE.match(bf.name):
-                all_blobs.append((bf.stat().st_ctime, bf.stat().st_size, bf))
+                # A blob's cap weight is its file plus its sidecars, since
+                # eviction frees both.
+                sz = bf.stat().st_size + self._sidecar_bytes(bf.name)
+                all_blobs.append((bf.stat().st_ctime, sz, bf))
         all_blobs.sort()  # oldest first
         total = sum(sz for _, sz, _ in all_blobs)
         for _, sz, bf in all_blobs:
@@ -321,6 +509,7 @@ class BlobStore:
             self._tombstone_everywhere(bf.name, now)
             if bf.exists():
                 bf.unlink()
+            self.delete_sidecars(bf.name)
             total -= sz
 
     def _tombstone_everywhere(self, bid: str, now) -> None:
