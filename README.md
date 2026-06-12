@@ -206,6 +206,11 @@ per-call size caps bound how much content one tool call can pull in.
   falls back to BM25 lexical ranking (dep-free, still useful). The embedding
   model downloads lazily on first semantic search. `numpy` is used for the
   vector maths when present, with a pure-Python fallback otherwise.
+- **Single-line blobs search by character window.** Minified JSON and other
+  payloads on one line are chunked into overlapping character windows so search
+  still localises a hit, but every window reports the same line number. On such
+  blobs a search hit narrows the content, not a `range` line span; use `grep` or
+  a wider `range` to pull the surrounding bytes.
 - **Pass-by-reference lands silently.** Expanded content reaches a tool without
   appearing in context, so it also bypasses any human or filter inspecting
   model-emitted args. Exec/exfil sinks are denied by default and a strict
