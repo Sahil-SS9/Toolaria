@@ -1,0 +1,11 @@
+name: toolaria
+version: "0.1.0"
+description: "Rescue oversized tool results before they flood context with a SHA256-addressed blob store and rescuer_fetch."
+author: "Sahil-SS9"
+kind: standalone
+provides_tools:
+  - rescuer_fetch
+provides_hooks:
+  - transform_tool_result
+  - on_session_start
+  - on_session_end

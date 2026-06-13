@@ -304,6 +304,17 @@ class BlobStore:
 
         cap = self.cfg.get("fetch_max_chars", 4000)
         bpath = self.blob_dir / blob_id
+
+        # Session scoping: when the host forwards session_id, the fetch tool
+        # should not become a cross-session oracle for guessed capability ids.
+        # Keep the empty-session fallback for older/single-session Hermes
+        # dispatchers that do not pass session_id yet.
+        if session_id and not self.session_references(blob_id, session_id):
+            tomb = self._tombstone_msg(blob_id, session_id)
+            if tomb:
+                return tomb
+            return f"Error: blob {blob_id} not available in this session"
+
         if not bpath.exists():
             tomb = self._tombstone_msg(blob_id, session_id)
             if tomb:

@@ -197,10 +197,30 @@ def test_stat_with_forwarded_session_id(plugin, toolaria):
 
 
 def test_stat_without_session_searches_indexes(plugin, toolaria):
-    """stat finds the tool name even when no session id is forwarded."""
+    """stat finds the tool name when legacy dispatchers forward no session id."""
     bid = toolaria._store.put("s" * 2500, "mcp_tool", session_id="some-s")
     r = toolaria._fetch(args={"id": bid, "mode": "stat"})
     assert "mcp_tool" in r
+
+
+def test_fetch_with_forwarded_session_denies_cross_session_read(plugin, toolaria):
+    """A forwarded session_id turns rescuer_fetch into a session-scoped read.
+
+    Blob ids are short capabilities. When the host knows the calling session,
+    a guessed id from another session must not reveal bytes or metadata.
+    """
+    bid = toolaria._store.put("SECRET DATA", "web_search", session_id="owner-s")
+    r = toolaria._fetch(args={"id": bid, "mode": "range", "start": 0, "count": 1},
+                        session_id="other-s")
+    assert "not available in this session" in r
+    assert "SECRET" not in r
+
+
+def test_fetch_without_session_keeps_legacy_global_read(plugin, toolaria):
+    """Back-compat: older Hermes dispatchers may not pass session_id yet."""
+    bid = toolaria._store.put("LEGACY READ", "web_search", session_id="owner-s")
+    r = toolaria._fetch(args={"id": bid, "mode": "range", "start": 0, "count": 1})
+    assert "LEGACY READ" in r
 
 
 def test_dedup(plugin, toolaria):
@@ -419,10 +439,11 @@ def test_tombstone_not_served_cross_session(plugin, toolaria):
     idx["blobs"][bid]["t"] = time.time() - 7200
     toolaria._store._save_idx(idx, "owner")
     toolaria._store.lazy_sweep()
-    # Another session fetching the same id gets the bare not-found, no tool name
+    # Another session gets a generic session-scoped denial, with no tool name
+    # or size from the owner session's tombstone.
     r = toolaria._fetch(args={"id": bid, "mode": "stat"}, session_id="intruder")
     assert "web_extract" not in r
-    assert "not found" in r
+    assert "not available in this session" in r
 
 
 def test_size_sweep_also_tombstones(plugin, toolaria):
