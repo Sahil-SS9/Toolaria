@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 from pathlib import Path
 
 try:
@@ -215,13 +216,14 @@ def _on_transform(
 
     try:
         if len(result) > _cfg.get("max_result_chars", 12000):
-            return _rescue(result, tool_name, session_id=session_id)
+            return _rescue(result, tool_name, args=args, session_id=session_id)
     except Exception as exc:
         logger.warning("toolaria: rescue failed for %s: %s", tool_name, exc)
     return None
 
 
-def _rescue(result: str, tool_name: str, session_id: str = "") -> str | None:
+def _rescue(result: str, tool_name: str, args: dict | None = None,
+            session_id: str = "") -> str | None:
     """Store the result and build the excerpt + handle block.
 
     Returns None (leave the original untouched) unless the blob is durably
@@ -243,10 +245,31 @@ def _rescue(result: str, tool_name: str, session_id: str = "") -> str | None:
     n_lines = result.count("\n") + 1
     head_lines = _cfg.get("head_lines", 40)
     tail_lines = _cfg.get("tail_lines", 15)
+    # Provenance: source URL + timestamp.
+    source = ""
+    if args and isinstance(args, dict):
+        source = args.get("url", args.get("path", args.get("source", "")))
+        source = str(source)[:200] if source else ""
+    at_str = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time()))
+    # Semantic role: classify blob by tool function.
+    role = _classify_role(tool_name, kind)
+    # Build handle with provenance + role enrichment.
+    header_fields = [
+        f"tool={tool_name}",
+    ]
+    if source:
+        header_fields.append(f"source={source}")
+    header_fields += [
+        f"at={at_str}",
+        f"role={role}",
+        f"size={len(result):,} chars",
+        f"lines={n_lines:,}",
+        f"type={kind} {meta}",
+        f"blob={blob_id}",
+    ]
+    header = "[Toolaria: tool result rescued. " + "; ".join(header_fields) + "]"
     return (
-        f"[Toolaria: tool result rescued. tool={tool_name}; "
-        f"size={len(result):,} chars; lines={n_lines:,}; "
-        f"type={kind} {meta}; blob={blob_id}]\n"
+        f"{header}\n"
         f"Preview (first {head_lines} / last {tail_lines} lines); "
         f"this is a preview, NOT the full output:\n"
         f"{excerpt}\n"
@@ -260,6 +283,36 @@ def _rescue(result: str, tool_name: str, session_id: str = "") -> str | None:
         f"\"tla:{blob_id}\" as that tool's argument; Toolaria expands it to the "
         f"full content before the tool runs."
     )
+
+
+def _classify_role(tool_name: str, kind: str) -> str:
+    """Classify a blob's semantic role: episodic, semantic, or procedural.
+
+    Heuristic derived from ENGRAM (arXiv 2511.12960) three-type memory model,
+    mapped to Toolaria's tool/kind signals."""
+    # Episodic: raw tool results — outputs of web search, browser, extraction.
+    episodic_tools = {
+        "web_search", "web_extract", "browser_navigate", "browser_snapshot",
+        "browser_click", "browser_type", "browser_scroll", "browser_press",
+        "browser_console", "browser_vision", "web_fetch",
+    }
+    # Semantic: structured summaries — outlines, search results, excerpts.
+    semantic_tools = {"rescuer_fetch"}
+    # Procedural: pass-by-reference tokens — tla:<id> expansions.
+    procedural_tools = {"passref_expand", "tla_expand"}
+
+    if tool_name in procedural_tools:
+        return "procedural"
+    if tool_name in semantic_tools:
+        return "semantic"
+    if tool_name in episodic_tools:
+        return "episodic"
+    # Fallback: classify by content kind.
+    if kind in ("json", "html"):
+        return "episodic"
+    if kind == "code":
+        return "procedural"
+    return "episodic"
 
 
 def _on_start(session_id="", **kwargs):

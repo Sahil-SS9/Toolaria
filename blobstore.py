@@ -396,6 +396,9 @@ class BlobStore:
                 return "Error: grep requires pattern=..."
             return self._grep_safe(lines, pattern, cap)
 
+        if mode == "chain":
+            return self._chain(lines, pattern, count, cap)
+
         return f"Error: unknown mode '{mode}'"
 
     # ── grep with timeout/complexity cap ───
@@ -455,6 +458,74 @@ class BlobStore:
         if not results:
             return f"[no matches for pattern '{pattern}' in {total} lines]"
         return "\n".join(results)[:cap]
+
+    # ── chain (composite grep→context) ─────
+
+    def _chain(self, lines: list, pattern: str, count: int, cap: int) -> str:
+        """Composite fetch: grep for pattern, return context around matches.
+
+        Bounded to a single grep→context two-step (not a full pipeline DSL).
+        The 80% case: \"find X and show me what's around it\" without the
+        model making separate grep + range calls."""
+        if not pattern:
+            return "Error: chain mode requires pattern="
+        ctx = max(1, min(count, 20))  # context_lines, default from count
+        total = len(lines)
+        # Reuse the same matching logic as grep mode.
+        per_line_timeout = self.cfg.get("grep_timeout_ms", 500) / 1000.0
+        wall_timeout = max(per_line_timeout, 2.0)
+        line_cap = self.cfg.get("grep_max_line_len", 2000)
+        if _HAVE_REGEX:
+            try:
+                preg = _regex_engine.compile(pattern, _regex_engine.I)
+            except _regex_engine.error as e:
+                return f"Error: invalid regex: {e}"
+            def _cm(line):  # noqa: E306
+                try:
+                    return bool(preg.search(line[:line_cap],
+                                            timeout=per_line_timeout))
+                except TimeoutError:
+                    return False
+        else:
+            if set(pattern) & _META_CHARS:
+                return ("Error: regex patterns need the optional 'regex' "
+                        "package; install it, or use a literal substring")
+            needle = pattern.lower()
+            def _cm(line):  # noqa: E306
+                return needle in line[:line_cap].lower()
+        # Find matching line numbers.
+        t0 = time.time()
+        match_lines = []
+        for n, line in enumerate(lines):
+            if time.time() - t0 > wall_timeout:
+                break
+            if _cm(line):
+                match_lines.append(n)
+                if len(match_lines) >= 30:
+                    break
+        if not match_lines:
+            return f"[chain: no matches for pattern '{pattern}' in {total} lines]"
+        # Build context windows around each match, merging overlaps.
+        windows = []
+        for ml in match_lines:
+            w_start = max(0, ml - ctx)
+            w_end = min(total, ml + ctx + 1)
+            windows.append((w_start, w_end))
+        # Merge overlapping windows.
+        merged = []
+        for ws, we in windows:
+            if merged and ws <= merged[-1][1]:
+                merged[-1] = (merged[-1][0], max(merged[-1][1], we))
+            else:
+                merged.append((ws, we))
+        # Render merged windows.
+        out = [f"[chain: {len(match_lines)} match(es) for '{pattern}' in "
+               f"{total} lines, ±{ctx} context lines]"]
+        for ws, we in merged:
+            gap = "" if ws == merged[0][0] else "...\n"
+            out.append(f"{gap}[lines {ws}..{we - 1}]")
+            out.append("\n".join(lines[ws:we]))
+        return "\n".join(out)[:cap]
 
     # ── sweep ──────────────────────────────
 
