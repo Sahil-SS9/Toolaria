@@ -504,6 +504,9 @@ class BlobStore:
                         weighted = sum(
                             0.5 ** ((now - t) / half_life) for t in fetch_times
                         )
+                        # Round to 4dp to avoid floating-point edge where
+                        # N recent fetches sum to 1.999999 instead of N.0.
+                        weighted = round(weighted, 4)
                     else:
                         weighted = 0.0
                     effective_ttl = hot_ttl if weighted >= threshold else ttl
@@ -652,23 +655,14 @@ class BlobStore:
                 count = meta.get("fetch_count", 0)
                 weight = meta.get("fetch_weight", 0.0)
                 if count > 0 and weight > 0:
-                    # Reconstruct timestamps: distribute them evenly over
-                    # the last half_life window such that the weighted sum
-                    # matches the persisted weight.
-                    if count == 1:
-                        age = -half_life * (weight - 1).bit_length() if weight < 1 else 0
-                        ts = now + age
-                    else:
-                        # Approximate: all fetches at the weighted-mean age
-                        # weight = count * 0.5^(age/half_life)
-                        # => age = half_life * log2(count/weight)
-                        import math
-                        if weight > 0 and count > 0:
-                            ratio = count / weight
-                            age = half_life * math.log2(max(ratio, 1.0))
-                            ts = now - age
-                        else:
-                            ts = now
+                    # Reconstruct a synthetic timestamp at the weighted-mean
+                    # age so the recency formula produces the persisted weight.
+                    # weight = count * 0.5^(age/half_life)
+                    # => age = half_life * log2(count/weight)
+                    import math
+                    ratio = count / weight if weight > 0 else 1.0
+                    age = half_life * math.log2(max(ratio, 1.0))
+                    ts = now - age
                     key = (safe_sid, bid)
                     self._fetch_log[key] = [ts] * count
 
