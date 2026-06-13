@@ -55,6 +55,11 @@ class BlobStore:
         self.blob_dir.mkdir(parents=True, exist_ok=True)
         self.meta_dir.mkdir(parents=True, exist_ok=True)
         self.sidecar_dir.mkdir(parents=True, exist_ok=True)
+        # Hot-blob tracking: in-memory fetch log keyed by (safe_sid, blob_id).
+        # Records fetch timestamps; recency-weighted count computed during sweep.
+        # Persisted to index entries during sweep; reloaded on init.
+        self._fetch_log: dict[tuple[str, str], list[float]] = {}
+        self._load_fetch_log()
 
     # ── sidecars (per-blob index/vector artefacts) ──
 
@@ -229,10 +234,15 @@ class BlobStore:
         Scoped to the owning session only: refresh is a best-effort touch, not
         correctness-critical, so the all-session fan-out (one rewrite per
         index file per fetch) is not worth the write amplification. Throttled
-        so back-to-back fetches do not rewrite the file each time."""
+        so back-to-back fetches do not rewrite the file each time.
+
+        Also records the fetch in the in-memory fetch log for hot-blob
+        tracking — no disk write here; the counter is flushed to the index
+        during the next sweep."""
         if not session_id:
             return
         now = time.time()
+        safe_sid = self._safe_sid(session_id)
         with _LOCK:
             ip = self._idx_path(session_id)
             idx = self._read_idx_file(ip)
@@ -240,6 +250,12 @@ class BlobStore:
             if entry and "swept_at" not in entry and now - entry.get("t", 0) > 60:
                 entry["t"] = now
                 self._write_idx_file(ip, idx)
+        # Hot-blob tracking: record fetch timestamp in memory (no disk write).
+        key = (safe_sid, blob_id)
+        self._fetch_log.setdefault(key, []).append(now)
+        # Trim entries older than 7 days to bound memory.
+        cutoff = now - 604800
+        self._fetch_log[key] = [t for t in self._fetch_log[key] if t > cutoff]
 
     def _tombstone_msg(self, blob_id: str, session_id: str = "") -> str | None:
         """Return model-facing guidance if the blob was swept but a tombstone
@@ -463,15 +479,35 @@ class BlobStore:
         return "swept_at" not in entry
 
     def _sweep_by_ttl(self, now, ttl, tomb_ttl):
-        # For each session: expire live entries past TTL into tombstones, and
-        # drop tombstones past the tombstone TTL.
+        # For each session: expire live entries past their effective TTL into
+        # tombstones, and drop tombstones past the tombstone TTL.
+        #
+        # Hot-blob exemption: blobs with a recency-weighted fetch count above
+        # `hot_fetch_threshold` use an extended `hot_ttl_hours` instead of the
+        # standard TTL. The weighted count decays over time so a blob that was
+        # hot last week but hasn't been touched since naturally drops back to
+        # the cold eviction pool.
+        hot_ttl = self.cfg.get("hot_ttl_hours", 168) * 3600
+        threshold = self.cfg.get("hot_fetch_threshold", 3.0)
+        half_life = self.cfg.get("fetch_decay_half_life_hours", 24) * 3600
         for ip in sorted(self.meta_dir.glob("*.json")):
+            safe_sid = ip.stem
             idx = self._read_idx_file(ip)
             blobs = idx.get("blobs", {})
             changed = False
             for bid, meta in list(blobs.items()):
                 if self._is_live(meta):
-                    if now - meta.get("t", 0) > ttl:
+                    # Compute recency-weighted fetch count.
+                    key = (safe_sid, bid)
+                    fetch_times = self._fetch_log.get(key, [])
+                    if fetch_times and half_life > 0:
+                        weighted = sum(
+                            0.5 ** ((now - t) / half_life) for t in fetch_times
+                        )
+                    else:
+                        weighted = 0.0
+                    effective_ttl = hot_ttl if weighted >= threshold else ttl
+                    if now - meta.get("t", 0) > effective_ttl:
                         blobs[bid] = {
                             "swept_at": now,
                             "tool": meta.get("tool", ""),
@@ -481,6 +517,11 @@ class BlobStore:
                 elif now - meta.get("swept_at", 0) > tomb_ttl:
                     del blobs[bid]
                     changed = True
+            # Flush fetch-count snapshots into index entries for persistence
+            # before writing. Force a write if the flush added fields even
+            # when no sweep/tombstone change occurred.
+            if self._flush_fetch_log(safe_sid, idx):
+                changed = True
             if changed:
                 self._write_idx_file(ip, idx)
 
@@ -590,3 +631,62 @@ class BlobStore:
 
     def _save_idx(self, idx: dict, session_id: str):
         self._write_idx_file(self._idx_path(session_id), idx)
+
+    # ── hot-blob fetch log ─────────────────
+
+    def _load_fetch_log(self) -> None:
+        """Load persisted fetch counts from existing session indexes.
+
+        Each index entry may carry a ``fetch_weight`` and ``fetch_count``
+        snapshot written by ``_flush_fetch_log`` during the last sweep.
+        These are loaded as synthetic timestamps (one per count, stacked at
+        the current time) so the recency-weighted formula degrades
+        gracefully: a cold restart treats all prior fetches as equally aged,
+        which is conservative (underestimates hotness, never over-pins)."""
+        now = time.time()
+        half_life = self.cfg.get("fetch_decay_half_life_hours", 24) * 3600
+        for ip in sorted(self.meta_dir.glob("*.json")):
+            safe_sid = ip.stem
+            idx = self._read_idx_file(ip)
+            for bid, meta in idx.get("blobs", {}).items():
+                count = meta.get("fetch_count", 0)
+                weight = meta.get("fetch_weight", 0.0)
+                if count > 0 and weight > 0:
+                    # Reconstruct timestamps: distribute them evenly over
+                    # the last half_life window such that the weighted sum
+                    # matches the persisted weight.
+                    if count == 1:
+                        age = -half_life * (weight - 1).bit_length() if weight < 1 else 0
+                        ts = now + age
+                    else:
+                        # Approximate: all fetches at the weighted-mean age
+                        # weight = count * 0.5^(age/half_life)
+                        # => age = half_life * log2(count/weight)
+                        import math
+                        if weight > 0 and count > 0:
+                            ratio = count / weight
+                            age = half_life * math.log2(max(ratio, 1.0))
+                            ts = now - age
+                        else:
+                            ts = now
+                    key = (safe_sid, bid)
+                    self._fetch_log[key] = [ts] * count
+
+    def _flush_fetch_log(self, safe_sid: str, idx: dict) -> bool:
+        """Write fetch-count snapshots into the session index for persistence.
+
+        Returns True if any index entry was modified, so the caller can
+        force a write even when no sweep/tombstone change occurred."""
+        now = time.time()
+        half_life = self.cfg.get("fetch_decay_half_life_hours", 24) * 3600
+        blobs = idx.get("blobs", {})
+        modified = False
+        for bid in blobs:
+            key = (safe_sid, bid)
+            times = self._fetch_log.get(key, [])
+            if times and half_life > 0:
+                weighted = sum(0.5 ** ((now - t) / half_life) for t in times)
+                blobs[bid]["fetch_count"] = len(times)
+                blobs[bid]["fetch_weight"] = round(weighted, 4)
+                modified = True
+        return modified

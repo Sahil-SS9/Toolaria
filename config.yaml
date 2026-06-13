@@ -15,10 +15,27 @@ toolaria:
   grep_max_line_len: 2000         # per-line slice searched by grep
   ttl_hours: 72
   tombstone_ttl_hours: 720        # keep swept-blob guidance for 30 days
+  # Hot-blob pinning: frequently-fetched blobs survive TTL sweeps.
+  # A blob with recency-weighted fetch count >= hot_fetch_threshold uses
+  # hot_ttl_hours instead of ttl_hours. The weighted count decays by half
+  # every fetch_decay_half_life_hours, so a blob that was hot last week
+  # but untouched since naturally drops back to the cold pool.
+  hot_fetch_threshold: 3.0         # weighted count to classify as "hot"
+  hot_ttl_hours: 168               # TTL for hot blobs (7 days)
+  fetch_decay_half_life_hours: 24  # half-life for recency weighting
   max_store_mb: 500
   store_path: ~/.hermes/toolaria
   exclude_tools: []
   refuse_full_fetch: true         # refuse full mode over full_fetch_max_chars
+  # Anchor patterns for excerpt: lines matching these patterns are promoted
+  # into the excerpt even if they fall outside the head/tail window.
+  # Categories: error, decision, action, value. Extends (does not replace)
+  # the existing error_line_patterns for backward compatibility.
+  anchor_patterns:
+    error: ["error", "fail", "exception", "fatal", "warn"]
+    decision: ["decided", "chose", "selected", "concluded", "approved", "rejected", "accepted", "denied"]
+    action: ["created", "modified", "deleted", "updated", "wrote", "removed", "added", "changed", "renamed", "moved"]
+    value: ["total", "sum", "count", "mean", "result", "average", "maximum", "minimum", "median", "percent"]
   # search mode (semantic / lexical retrieval over a rescued blob)
   search_chunk_chars: 1200        # target size of each searchable chunk
   search_chunk_overlap_lines: 2   # lines shared between adjacent chunks

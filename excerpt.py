@@ -71,7 +71,7 @@ def _safe_json_tail(obj, n):
 
 def build_excerpt(raw: str, kind: str, cfg: dict):
     """Build excerpt from raw + kind. cfg keys: head_lines, tail_lines,
-    json_head_items, json_tail_items, error_line_patterns."""
+    json_head_items, json_tail_items, error_line_patterns, anchor_patterns."""
     if kind == "binary":
         return f"[binary data, {len(raw) if isinstance(raw, bytes) else 'unknown'} bytes]"
 
@@ -100,11 +100,14 @@ def build_excerpt(raw: str, kind: str, cfg: dict):
             if n_items > head_n + tail_n:
                 parts.append("--- tail ---")
                 parts.append(tail)
-            # Error lines
-            errs = _error_lines(lines, cfg.get("error_line_patterns", []))
-            if errs:
-                parts.append("--- error lines ---")
-                parts.extend(errs[:10])
+            # Error lines — use anchor_patterns if present, else legacy flat list.
+            if cfg.get("anchor_patterns"):
+                _append_anchor_lines(parts, lines, cfg)
+            else:
+                errs = _error_lines(lines, cfg.get("error_line_patterns", []))
+                if errs:
+                    parts.append("--- error lines ---")
+                    parts.extend(errs[:10])
             return "\n".join(parts)
         except Exception:
             pass  # fall through to text handler
@@ -119,10 +122,15 @@ def build_excerpt(raw: str, kind: str, cfg: dict):
         parts.append("\n".join(lines[:hl]))
         parts.append("--- tail ---")
         parts.append("\n".join(lines[-tl:]))
-    errs = _error_lines(lines, cfg.get("error_line_patterns", []))
-    if errs:
-        parts.append("--- error lines ---")
-        parts.extend(errs[:10])
+    # Error/decision/action/value lines — use anchor_patterns if present,
+    # else legacy flat error_line_patterns for backward compatibility.
+    if cfg.get("anchor_patterns"):
+        _append_anchor_lines(parts, lines, cfg)
+    else:
+        errs = _error_lines(lines, cfg.get("error_line_patterns", []))
+        if errs:
+            parts.append("--- error lines ---")
+            parts.extend(errs[:10])
     return "\n".join(parts)
 
 
@@ -131,6 +139,50 @@ def _error_lines(lines, patterns):
         return []
     lp = _err_re(tuple(patterns))
     return [l[:500] for l in lines if lp.search(l)][:20]
+
+
+def _append_anchor_lines(parts: list, lines: list[str], cfg: dict) -> None:
+    """Append lines matching anchor pattern categories to the excerpt.
+
+    Reads ``anchor_patterns`` from config (a dict of category→pattern-list).
+    Each category gets its own section header. Lines already appearing in
+    the head/tail/error sections are NOT deduplicated — the model benefits
+    from seeing them in context.
+    """
+    anchor_cfg = cfg.get("anchor_patterns")
+    if not anchor_cfg or not isinstance(anchor_cfg, dict):
+        return
+    seen = set()
+    category_labels = {
+        "error": "error lines",
+        "decision": "decision anchors",
+        "action": "action anchors",
+        "value": "value anchors",
+    }
+    for category, patterns in anchor_cfg.items():
+        if not patterns or not isinstance(patterns, list):
+            continue
+        matched = _anchor_lines_for_category(lines, patterns)
+        if matched:
+            label = category_labels.get(category, f"{category} anchors")
+            parts.append(f"--- {label} ---")
+            for m in matched:
+                if m not in seen:
+                    parts.append(m[:500])
+                    seen.add(m)
+
+
+@functools.lru_cache(maxsize=16)
+def _anchor_re(patterns: tuple):
+    return re.compile("|".join(re.escape(p) for p in patterns), re.I)
+
+
+def _anchor_lines_for_category(lines: list[str], patterns: list[str]) -> list[str]:
+    """Return lines matching any pattern in the category, up to 10."""
+    if not patterns:
+        return []
+    lp = _anchor_re(tuple(patterns))
+    return [l for l in lines if lp.search(l)][:10]
 
 
 def kind_desc(raw, obj):
