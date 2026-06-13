@@ -1,7 +1,7 @@
 name: toolaria
-version: "0.1.0"
-description: "Rescue oversized tool results before they flood context with a SHA256-addressed blob store and rescuer_fetch."
-author: "Sahil-SS9"
+version: "2.0.0"
+description: "Rescue oversized MCP/web tool results before they flood context. Stores full result to disk via SHA256-addressed blob store. Returns excerpt + handle block. Provides rescuer_fetch tool (range/grep/search/outline/stat/full) and pass-by-reference (tla:<id>) for downstream tools."
+author: "Sahil Saghir (KENSEI)"
 kind: standalone
 provides_tools:
   - rescuer_fetch
