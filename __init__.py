@@ -25,6 +25,11 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
+# Toolset under which rescuer_fetch registers, and which is marked ambient so
+# the tool is reachable in every session. One constant keeps the registration
+# and the ambient marking from drifting apart.
+_RESCUER_TOOLSET = "rescuer"
+
 _store: BlobStore | None = None
 _cfg: dict = {}
 
@@ -140,7 +145,7 @@ def register(ctx) -> None:
 
     ctx.register_tool(
         name="rescuer_fetch",
-        toolset="rescuer",
+        toolset=_RESCUER_TOOLSET,
         description=(
             "Fetch slices of a rescued oversized tool result. Modes: "
             "outline | search(query) | range(start,count) | grep(pattern) | "
@@ -185,11 +190,57 @@ def register(ctx) -> None:
         },
     )
 
+    # Availability symmetry: the rescue hook above fires UNGATED in every
+    # session, so its inverse (rescuer_fetch) must be reachable in every
+    # session too, or a rescued result becomes an unredeemable handle. Mark
+    # the rescuer toolset ambient so the host always surfaces rescuer_fetch
+    # regardless of a session's enabled_toolsets scope. Safe to expose
+    # broadly because fetch() stays session-scoped at the data layer (a
+    # session can only read blobs it rescued). On a host without ambient
+    # support, fail LOUD rather than silently emit dead handles in
+    # toolset-restricted sessions.
+    _mark_rescuer_ambient()
+
     ctx.register_command(
         name="rescuer",
         handler=_status_cmd,
         description="Show Toolaria status: blob count, total size, sessions",
     )
+
+
+def _mark_rescuer_ambient() -> None:
+    """Register the rescuer toolset as ambient with the host tool registry.
+
+    Idempotent and host-agnostic: a host that predates ambient-toolset support
+    simply lacks ``registry.mark_ambient``, in which case we emit a prominent
+    warning so the operator enables the ``rescuer`` toolset for cron/profile
+    sessions instead of discovering dead handles in the logs days later."""
+    try:
+        from tools.registry import registry
+    except Exception as exc:
+        logger.warning(
+            "toolaria: tool registry unavailable, cannot guarantee rescuer_fetch "
+            "availability (%s); rescue handles may be unredeemable in restricted "
+            "sessions", exc,
+        )
+        return
+    mark = getattr(registry, "mark_ambient", None)
+    if not callable(mark):
+        logger.warning(
+            "toolaria: host lacks ambient-toolset support; rescuer_fetch will be "
+            "UNAVAILABLE in toolset-restricted sessions (cron/profile) and rescue "
+            "handles there cannot be fetched. Add 'rescuer' to those sessions' "
+            "enabled_toolsets, or upgrade the host.",
+        )
+        return
+    try:
+        mark(_RESCUER_TOOLSET)
+        logger.info(
+            "toolaria: rescuer toolset marked ambient; rescuer_fetch is reachable "
+            "in every session regardless of toolset scope",
+        )
+    except Exception as exc:
+        logger.warning("toolaria: mark_ambient('rescuer') failed: %s", exc)
 
 
 # ── hooks ────────────────────────────────────────────────────────────────
