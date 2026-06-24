@@ -90,6 +90,15 @@ hermes plugin reload
 Any oversized web extract, search, or MCP result now returns a compact excerpt
 with a fetch handle instead of flooding context. Check status with `/rescuer`.
 
+> **Availability in restricted sessions.** The rescue runs as an ungated hook, so
+> it fires in every session, including toolset-restricted ones (cron jobs, scoped
+> profiles). For the `rescuer_fetch` handle to be redeemable there, the tool must
+> be reachable. On hosts that support ambient toolsets, Toolaria marks its
+> `rescuer` toolset ambient at load, so nothing more is needed. On hosts that do
+> not, Toolaria logs a warning at load; add `rescuer` to those sessions'
+> `enabled_toolsets` so the handle can be fetched. A handle you cannot fetch is
+> worse than no rescue, so Toolaria never fails this silently.
+
 ---
 
 ## Prior art
