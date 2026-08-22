@@ -35,6 +35,11 @@ _cfg: dict = {}
 
 # Tools whose results may exceed context: the only built-ins rescued.
 # MCP tools are detected dynamically via the registry toolset prefix.
+# Phase 0 (T0.3): mail-send / social-post / webhook / peer-messaging tools
+# are explicitly rescuable too — passref (downstream handoff) blocks them
+# via the external-destination deny list, but the upstream rescue path
+# still spills their oversized RESULTS to disk so the model can fetch
+# them by handle like any other rescued blob.
 _RESCUABLE_TOOLS: set[str] = {
     "web_extract",
     "web_search",
@@ -42,6 +47,12 @@ _RESCUABLE_TOOLS: set[str] = {
     "browser_snapshot",
     "browser_console",
     "browser_get_images",
+    # External-destination class — rescue upstream, deny passref downstream.
+    "send_email", "send_mail", "post_email", "compose_email", "mail_send",
+    "social_post", "twitter_post", "linkedin_post", "post_to_social",
+    "post_tweet", "post_update",
+    "webhook_send", "send_webhook", "slack_post", "discord_send",
+    "peer_send_message", "peer_broadcast",
 }
 
 # Single source of truth for tools that must never be intercepted.

@@ -48,3 +48,14 @@ toolaria:
   passref_max_chars: 500000       # cap on content expanded per token
   passref_total_max_chars: 2000000  # cap on total expansion per tool call
   passref_allowed_tools: []       # strict allowlist; empty = all but exec/exfil sinks
+  # External-destination deny list (Phase 0 T0.3). Tools on this list can
+  # still be RESCUED (their oversized results spill to disk normally), but
+  # tla:<id> tokens are NEVER expanded into their args — the destination
+  # tool sees an honest refusal marker instead. This list is unioned with
+  # a hardcoded seed of mail-send / social-post / webhook / peer-messaging
+  # class names (see passref.DEFAULT_EXTERNAL_DESTINATIONS) so the safety
+  # net is on by default; set passref_disable_builtin_destinations: true
+  # to use only the operator-configured list. This list overrides
+  # passref_allowed_tools — a permissive allowlist cannot re-enable an
+  # external send.
+  passref_external_destinations: []

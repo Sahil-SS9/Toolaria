@@ -234,3 +234,153 @@ def test_excluded_shell_tool_not_rescued_even_when_in_allowlist(
     big = "data " * 1500
     # Even with a forced rescue path, shell must not be rescued.
     assert toolaria._on_transform(tool_name="shell", result=big) is None
+
+
+# ═══ T0.3 — passref_external_destinations deny list ═══
+
+
+DEST_TOOLS = [
+    "send_email", "send_mail", "post_email",
+    "social_post", "twitter_post", "linkedin_post", "post_to_social",
+    "webhook_send", "send_webhook", "slack_post",
+    "peer_send_message", "peer_broadcast",
+]
+
+
+def test_external_destination_expansion_returns_honest_marker(plugin, toolaria):
+    """A tla:<id> token expanded into a mail/social/webhook/peer destination
+    must yield an honest marker — the destination tool sees the handle
+    failed, not the content."""
+    big = "SECRET PAYLOAD " * 500
+    bid = toolaria._store.put(big, "web_extract", session_id="test-s")
+    mw = plugin[0].middleware["tool_request"][0]
+    for tool in DEST_TOOLS:
+        out = mw(tool_name=tool, args={"body": f"tla:{bid}"})
+        assert out is not None, f"{tool} must not silently pass-through"
+        v = out["args"]["body"]
+        assert "SECRET" not in v, (
+            f"{tool} received the secret content; expansion must yield a "
+            f"marker, not the bytes"
+        )
+        assert "external destination" in v.lower() or "denied" in v.lower(), (
+            f"{tool} marker missing explanation: {v!r}"
+        )
+
+
+def test_external_destination_results_still_rescued(toolaria, plugin):
+    """T0.3 must NOT merge the new list into exclude_tools: those tools'
+    oversized results must still be rescued (passref just refuses the
+    cross-tool handoff)."""
+    big = "MAIL BODY " * 1000
+    for tool in ("send_email", "slack_post"):
+        r = toolaria._on_transform(tool_name=tool, result=big)
+        assert r is not None, (
+            f"{tool} oversized result was not rescued; T0.3 must not merge "
+            f"passref_external_destinations into exclude_tools"
+        )
+        assert "rescued" in r
+
+
+def test_destination_deny_overrides_passref_allowed_tools(plugin, toolaria):
+    """Precedence: an entry in passref_external_destinations beats an entry
+    in passref_allowed_tools. The whole point of the deny list is to NOT be
+    overridable by an operator's permissive allowlist."""
+    toolaria._cfg["passref_allowed_tools"] = list(DEST_TOOLS)
+    big = "SECRET " * 500
+    bid = toolaria._store.put(big, "web_extract", session_id="test-s")
+    mw = plugin[0].middleware["tool_request"][0]
+    out = mw(tool_name="send_email", args={"body": f"tla:{bid}"})
+    v = out["args"]["body"]
+    assert "SECRET" not in v, "destination deny must beat allowlist"
+    assert "external destination" in v.lower() or "denied" in v.lower()
+
+
+def test_destination_deny_overrides_sink_default(plugin, toolaria):
+    """Precedence: an explicit allowlist must not let a destination expand
+    either. Same point as above from the other side of the matrix."""
+    # passref_allowed_tools empty (default) → sink-deny governs; this test
+    # exercises the case where an operator narrows sinks but adds destinations.
+    toolaria._cfg["passref_allowed_tools"] = ["send_email"]  # explicitly whitelisted
+    big = "DATA " * 500
+    bid = toolaria._store.put(big, "web_extract", session_id="test-s")
+    mw = plugin[0].middleware["tool_request"][0]
+    out = mw(tool_name="send_email", args={"body": f"tla:{bid}"})
+    v = out["args"]["body"]
+    assert "DATA" not in v, "destination deny beats allowlist entry"
+    assert "external destination" in v.lower() or "denied" in v.lower()
+
+
+def test_non_destination_tools_unaffected_by_deny_list(plugin, toolaria):
+    """A tool not on the deny list still expands normally — the deny list is
+    a targeted external-send gate, not a blanket expansion disable."""
+    big = "PLAIN " * 200
+    bid = toolaria._store.put(big, "web_extract", session_id="test-s")
+    mw = plugin[0].middleware["tool_request"][0]
+    out = mw(tool_name="summarise", args={"body": f"tla:{bid}"})
+    assert out["args"]["body"] == big
+
+
+def test_config_defaults_to_empty_destination_list(toolaria, tmp_path):
+    """Plugin-local config.yaml must include the passref_external_destinations
+    key (so operators can configure it). Use raw text matching so the test
+    does not require PyYAML."""
+    cfg_path = toolaria._LOCAL_CFG  # type: ignore[attr-defined]
+    raw = cfg_path.read_text()
+    assert "passref_external_destinations:" in raw, (
+        "config.yaml must expose the new key so operators can configure it"
+    )
+
+
+def test_destination_list_driven_by_config(plugin, toolaria):
+    """Operator configures the list at runtime; the deny set tracks it
+    without code edits.
+
+    This test mutates cfg in place after register() ran. The deny set is
+    recomputed on demand when the operator-key changes, so direct cfg
+    mutation (which is the operator's actual workflow at runtime) takes
+    effect immediately.
+    """
+    # Clear the cached frozen set so the change takes effect.
+    toolaria._cfg.pop("_passref_external_destinations_frozen", None)
+    toolaria._cfg["passref_external_destinations"] = ["my_custom_mailer"]
+    big = "SECRET " * 500
+    bid = toolaria._store.put(big, "web_extract", session_id="test-s")
+    mw = plugin[0].middleware["tool_request"][0]
+    out = mw(tool_name="my_custom_mailer", args={"body": f"tla:{bid}"})
+    v = out["args"]["body"]
+    assert "SECRET" not in v, (
+        f"custom destination {out['args']['body']!r}"
+    )
+    assert "external destination" in v.lower() or "denied" in v.lower()
+    # And another non-listed tool still expands.
+    bid2 = toolaria._store.put("PLAIN", "web_extract", session_id="test-s")
+    out2 = mw(tool_name="summarise", args={"body": f"tla:{bid2}"})
+    assert out2["args"]["body"] == "PLAIN"
+
+
+def test_destination_list_must_be_list_of_strings(toolaria):
+    """Malformed config (non-list, non-string entries) must be rejected at
+    load time, not silently dropped or silently widen the deny set."""
+    from passref import _parse_external_destinations
+    # non-list
+    with pytest.raises(ValueError):
+        _parse_external_destinations("not a list")
+    # list with non-string
+    with pytest.raises(ValueError):
+        _parse_external_destinations(["ok", 42])
+    # empty list OK
+    assert _parse_external_destinations([]) == frozenset()
+    # proper list
+    assert _parse_external_destinations(["a", "b"]) == frozenset({"a", "b"})
+    # deduplicated
+    assert _parse_external_destinations(["a", "a", "b"]) == frozenset({"a", "b"})
+
+
+def test_destinations_documented_in_plugin_config(toolaria):
+    """The shipped defaults key is present and the precedence comment
+    exists. Use raw text matching so the test does not require PyYAML."""
+    cfg = toolaria._LOCAL_CFG.read_text()  # type: ignore[attr-defined]
+    assert "passref_external_destinations:" in cfg
+    # Comment must explain the deny-vs-allow precedence.
+    assert "external" in cfg.lower()
+    assert "allowlist" in cfg.lower() or "passref_allowed_tools" in cfg
