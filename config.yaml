@@ -59,3 +59,10 @@ toolaria:
   # passref_allowed_tools — a permissive allowlist cannot re-enable an
   # external send.
   passref_external_destinations: []
+  # Phase 1 — Instrumentation (T1.1/T1.2/T1.3/T1.4)
+  # Per-fetch instrumentation. Each of these ships default-off or
+  # default-on as specified in docs/plans/2026-08-22-governance-expansion.md;
+  # they are zero-cost in their default state.
+  sequence_capture: false           # T1.2: write {ts,sid,blob_id} to store_path/sequences/events.jsonl on every fetch
+  args_snapshot_max_chars: 2000     # T1.3: cap on the per-blob redacted args snapshot stored in the session index
+  verify_integrity: true            # T1.4: SHA256-compare blob bytes against the index hash on every fetch; refuse + log mismatch

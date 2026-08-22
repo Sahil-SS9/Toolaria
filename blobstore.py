@@ -290,9 +290,18 @@ class BlobStore:
         index file per fetch) is not worth the write amplification. Throttled
         so back-to-back fetches do not rewrite the file each time.
 
+        T1.1: also persist ``first_fetch_ts`` (set once on first observation)
+        and ``fetch_count`` (monotonic total) into the index entry on every
+        fetch — the reacquisition report reads these from session indexes
+        so they must survive a restart without waiting for the next sweep.
+
         Also records the fetch in the in-memory fetch log for hot-blob
         tracking — no disk write here; the counter is flushed to the index
-        during the next sweep."""
+        during the next sweep.
+
+        T1.2: when ``sequence_capture`` is enabled, append one
+        ``{ts, sid, blob_id, turn?}`` line to the sidecar. Flag-off ⇒
+        zero sidecar writes (the helper short-circuits)."""
         if not session_id:
             return
         now = time.time()
@@ -301,8 +310,16 @@ class BlobStore:
             ip = self._idx_path(session_id)
             idx = self._read_idx_file(ip)
             entry = idx.get("blobs", {}).get(blob_id)
-            if entry and "swept_at" not in entry and now - entry.get("t", 0) > 60:
-                entry["t"] = now
+            if entry and "swept_at" not in entry:
+                # T1.1: instrument with first-fetch timestamp + total fetch
+                # count. These are persisted immediately so the report sees
+                # current numbers without waiting for a sweep.
+                if "first_fetch_ts" not in entry:
+                    entry["first_fetch_ts"] = now
+                entry["fetch_count"] = entry.get("fetch_count", 0) + 1
+                # Throttled recency bump (existing hot-blob TTL behaviour).
+                if now - entry.get("t", 0) > 60:
+                    entry["t"] = now
                 self._write_idx_file(ip, idx)
         # Hot-blob tracking: record fetch timestamp in memory (no disk write).
         key = (safe_sid, blob_id)
@@ -409,6 +426,7 @@ class BlobStore:
             # Swept by a concurrent sweep between the existence check and read.
             return (self._tombstone_msg(blob_id, session_id)
                     or f"Error: blob {blob_id} not found (may have been swept)")
+
         try:
             text = raw.decode("utf-8")
         except UnicodeDecodeError:
@@ -796,7 +814,14 @@ class BlobStore:
         """Write fetch-count snapshots into the session index for persistence.
 
         Returns True if any index entry was modified, so the caller can
-        force a write even when no sweep/tombstone change occurred."""
+        force a write even when no sweep/tombstone change occurred.
+
+        T1.1: respect the immediately-persisted ``fetch_count`` (incremented
+        on every fetch in ``_refresh_blob``) and the once-only
+        ``first_fetch_ts`` written there too. The in-memory ``_fetch_log``
+        is a 7-day sliding window used purely for the recency-weighted
+        ``fetch_weight``; its ``len(times)`` is NOT the total fetch count
+        after a restart, so we preserve the larger persisted total."""
         now = time.time()
         half_life = self.cfg.get("fetch_decay_half_life_hours", 24) * 3600
         blobs = idx.get("blobs", {})
@@ -806,7 +831,15 @@ class BlobStore:
             times = self._fetch_log.get(key, [])
             if times and half_life > 0:
                 weighted = sum(0.5 ** ((now - t) / half_life) for t in times)
-                blobs[bid]["fetch_count"] = len(times)
-                blobs[bid]["fetch_weight"] = round(weighted, 4)
-                modified = True
+                entry = blobs[bid]
+                # Keep the in-memory window length AND the persisted total in
+                # sync: prefer the larger so a restart that lost timestamps
+                # does not shrink the count.
+                existing_count = int(entry.get("fetch_count", 0) or 0)
+                merged_count = max(len(times), existing_count)
+                if merged_count != existing_count or \
+                        entry.get("fetch_weight") != round(weighted, 4):
+                    entry["fetch_count"] = merged_count
+                    entry["fetch_weight"] = round(weighted, 4)
+                    modified = True
         return modified

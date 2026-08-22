@@ -136,10 +136,27 @@ def _load_defaults() -> dict:
 
 
 def _merge_cfg(user_cfg: dict) -> dict:
-    """Merge user config over plugin defaults."""
+    """Merge user config over plugin defaults.
+
+    Phase 1 instrumentation defaults (T1.1/T1.2/T1.3/T1.4) are seeded in
+    code so the cfg carries them even when PyYAML is unavailable to parse
+    config.yaml. The YAML file remains the operator-facing knob; the
+    code-level defaults are the hard floor that keeps the suite passing
+    on the canonical test runner (``uv run --with pytest --with regex``)."""
     defaults = _load_defaults()
     defaults.update(user_cfg)
+    for _k, _v in _PHASE1_DEFAULTS.items():
+        defaults.setdefault(_k, _v)
     return defaults
+
+
+# Phase 1 instrumentation defaults (T1.1/T1.2/T1.3/T1.4). See
+# docs/plans/2026-08-22-governance-expansion.md for rationale.
+_PHASE1_DEFAULTS: dict = {
+    "sequence_capture": False,      # T1.2: default OFF ⇒ zero sidecar writes
+    "args_snapshot_max_chars": 2000,  # T1.3: cap on the per-blob redacted args snapshot
+    "verify_integrity": True,        # T1.4: default ON; benchmarks opt out via cfg
+}
 
 
 def register(ctx) -> None:
