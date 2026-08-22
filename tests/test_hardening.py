@@ -377,7 +377,85 @@ def test_destination_list_must_be_list_of_strings(toolaria):
     assert _parse_external_destinations(["a", "a", "b"]) == frozenset({"a", "b"})
 
 
-# ═══ T0.4 — Fail-loud middleware fallback + conditional tla: handle text ═══
+# ═══ T0.5 — Chain mode in schema/docs + ARCHITECTURE.md drift fix ═══
+
+
+def test_chain_mode_in_registered_schema(toolaria, plugin):
+    """The shipped tool schema must list ``chain`` in the mode enum so
+    models that read the schema (instead of the description text) know
+    the mode exists."""
+    fc, _ = plugin
+    schema = fc.tools["rescuer_fetch"]["schema"]
+    enum = schema["parameters"]["properties"]["mode"]["enum"]
+    assert "chain" in enum, (
+        f"chain mode missing from schema enum: {enum!r}. A model reading "
+        f"the schema would not know the composite fetch mode exists."
+    )
+
+
+def test_chain_mode_in_description(toolaria, plugin):
+    """The schema description (what the model sees) also lists modes so
+    a model that consults the description first sees chain."""
+    fc, _ = plugin
+    # The tool description is part of the schema in this codebase (the
+    # schema is what the model reads, not the register_tool description
+    # parameter). Both must name chain.
+    desc = fc.tools["rescuer_fetch"]["schema"]["description"]
+    assert "chain" in desc, (
+        f"chain mode missing from tool schema description: {desc!r}"
+    )
+
+
+def test_chain_mode_end_to_end(toolaria, plugin):
+    """chain mode is implemented in BlobStore.fetch(); the registered
+    handler must dispatch to it without an enum-rejection."""
+    content = "\n".join(f"line {i} context" for i in range(100)) \
+        + "\nNEEDLE here\n" \
+        + "\n".join(f"line {i+101} context" for i in range(20))
+    bid = toolaria._store.put(content, "web_extract", session_id="test-s")
+    out = toolaria._fetch(
+        args={"id": bid, "mode": "chain", "pattern": "NEEDLE", "count": 3},
+        session_id="test-s",
+    )
+    assert "NEEDLE" in out
+    assert "chain:" in out or "match" in out.lower()
+
+
+def test_chain_in_blobstore_docstring():
+    """The fetch() docstring must enumerate chain alongside the other
+    modes so callers reading the source know about it without spelunking."""
+    import inspect
+    from blobstore import BlobStore
+    src = inspect.getsource(BlobStore.fetch)
+    assert "chain" in src, "BlobStore.fetch() must document chain mode"
+
+
+def test_chain_documented_in_readme():
+    """The user-facing README documents each fetch mode; chain must be in
+    the table."""
+    readme = (Path(__file__).resolve().parents[1] / "README.md").read_text()
+    assert "`chain`" in readme or "chain |" in readme, (
+        "README fetch-mode table must include chain"
+    )
+
+
+def test_architecture_session_filename_drift_fixed():
+    """ARCHITECTURE.md previously documented per-session indexes as
+    ``session-<id>.json`` but the real naming is ``<slug>-<digest>.json``
+    (see BlobStore._safe_sid). The drift fix must show the real shape."""
+    arch = (Path(__file__).resolve().parents[1]
+            / "docs" / "ARCHITECTURE.md").read_text()
+    # The old, drifted example must not appear anywhere in the doc.
+    assert "session-abc123.json" not in arch, (
+        "ARCHITECTURE.md still shows the drifted `session-<id>.json` shape"
+    )
+    # The real shape is documented (look for a slug-and-digest example).
+    low = arch.lower()
+    assert ("<slug>" in low and "<digest>" in low) or "-digest" in low \
+        or "<sha-prefix>" in low or "<slug>-<" in low, (
+        f"ARCHITECTURE.md must document the real <slug>-<digest>.json "
+        f"naming; not found in:\n{arch}"
+    )
 
 
 class _NoMiddlewareCtx(FakeCtx):

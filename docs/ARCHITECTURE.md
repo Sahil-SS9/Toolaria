@@ -80,8 +80,13 @@ store_path (default ~/.hermes/toolaria/)
 │   ├── a1b2c3d4e5f6       # raw blob (12 hex chars = first 12 of SHA256)
 │   └── f6e5d4c3b2a1       # ... more blobs
 └── sessions/
-    ├── session-abc123.json # per-session index (blob ids + metadata)
-    └── session-def456.json
+    ├── <slug>-<digest>.json   # per-session index (see BlobStore._safe_sid)
+    │                          # <slug> = 32-char printable prefix of the
+    │                          #          session id (path-safe)
+    │                          # <digest> = first 12 hex of SHA256(session_id)
+    │                          # Together they form an injective, traversal-
+    │                          # safe filename that is also human-debuggable.
+    └── <slug>-<digest>.json   # more sessions
 ```
 
 ### Key guarantees

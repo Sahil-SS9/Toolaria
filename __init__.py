@@ -193,12 +193,16 @@ def register(ctx) -> None:
         description=(
             "Fetch slices of a rescued oversized tool result. Modes: "
             "outline | search(query) | range(start,count) | grep(pattern) | "
-            "stat | full"
+            "chain(pattern, count) | stat | full"
         ),
         handler=_fetch,
         schema={
             "name": "rescuer_fetch",
-            "description": "Retrieve slices of a rescued tool result blob",
+            "description": (
+                "Retrieve slices of a rescued tool result blob. Modes: "
+                "outline | search(query) | range(start,count) | "
+                "grep(pattern) | chain(pattern,count) | stat | full."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -209,7 +213,7 @@ def register(ctx) -> None:
                     "mode": {
                         "type": "string",
                         "enum": ["outline", "search", "range", "grep",
-                                 "stat", "full"],
+                                 "chain", "stat", "full"],
                         "description": "Retrieval mode (default: stat)",
                     },
                     "start": {
@@ -218,11 +222,14 @@ def register(ctx) -> None:
                     },
                     "count": {
                         "type": "integer",
-                        "description": "Lines to return in range mode (default: 20)",
+                        "description": "Lines to return for range mode or "
+                                       "context width for chain mode "
+                                       "(default: 20)",
                     },
                     "pattern": {
                         "type": "string",
-                        "description": "Regex for grep mode",
+                        "description": "Regex for grep mode, also used by "
+                                       "chain mode for the match step",
                     },
                     "query": {
                         "type": "string",

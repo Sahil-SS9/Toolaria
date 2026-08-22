@@ -224,6 +224,7 @@ The model-facing tool to retrieve slices of a rescued result.
 | `stat` | `id` | Blob metadata (size, tool, timestamp) |
 | `range` | `id`, `start`, `count` | Lines `start` to `start+count`; the response echoes the line range and total |
 | `grep` | `id`, `pattern` | Regex match within the blob, with line numbers |
+| `chain` | `id`, `pattern`, `count` | Composite: grep for `pattern` then return `count` lines of context around each match |
 | `full` | `id` | Full content (refused over `full_fetch_max_chars` by default) |
 
 If a blob has been swept after its retention window, `rescuer_fetch` returns a
