@@ -33,6 +33,15 @@ _RESCUER_TOOLSET = "rescuer"
 _store: BlobStore | None = None
 _cfg: dict = {}
 
+# Phase 0 hardening (T0.4): set to True by register() when the host exposes
+# the tool_request middleware contract. Until set, pass-by-reference is
+# "dead" — there is no path that can expand a tla:<id> token. The rescue
+# handle must not advertise the tla:<id> instruction while this is False,
+# because the instruction would be a dead handle (worse than no rescue).
+# Cleared back to False whenever the host signals that middleware
+# registration failed (e.g. attribute missing).
+_passref_alive: bool = False
+
 # Tools whose results may exceed context: the only built-ins rescued.
 # MCP tools are detected dynamically via the registry toolset prefix.
 # Phase 0 (T0.3): mail-send / social-post / webhook / peer-messaging tools
@@ -155,13 +164,27 @@ def register(ctx) -> None:
 
     # Pass-by-reference: expand tla:<id> tokens in downstream tool args into
     # full blob content before the tool runs, so a rescued result can flow
-    # tool to tool without ever re-entering the model's context. Always
-    # registered when the host supports middleware; passref_enabled is the
-    # single live on/off check, inside the callback.
+    # tool to tool without ever re-entering the model's context. The
+    # ``register_middleware`` contract is host-version dependent; older
+    # hosts lack it entirely. Phase 0 (T0.4): on a missing register helper,
+    # log a fail-loud WARNING and mark passref dead so subsequent rescue
+    # handles do NOT advertise a tla:<id> instruction the host cannot
+    # honour. A dead handle is worse than no rescue.
+    global _passref_alive
     if hasattr(ctx, "register_middleware"):
         ctx.register_middleware(
             "tool_request",
             _make_passref_mw(lambda: _store, _cfg, _UNCONDITIONAL_EXCLUDES),
+        )
+        _passref_alive = bool(_cfg.get("passref_enabled", True))
+    else:
+        _passref_alive = False
+        logger.warning(
+            "toolaria: host lacks register_middleware; pass-by-reference "
+            "expansion disabled. Rescue handles will omit the tla:<id> "
+            "instruction (a dead handle is worse than no rescue). Upgrade "
+            "the host or disable passref (passref_enabled: false) to "
+            "silence this warning."
         )
 
     ctx.register_tool(
@@ -294,6 +317,18 @@ def _on_transform(
     return None
 
 
+def _passref_active() -> bool:
+    """True if a tla:<id> instruction in a rescue handle will be honoured.
+
+    Combines the register-time middleware-availability check
+    (``_passref_alive``) with the per-request passref_enabled config knob
+    so the rescue handle text stays in lock-step with the runtime state
+    of the expansion middleware. Both must be true for the instruction
+    to be emitted.
+    """
+    return bool(_passref_alive) and bool(_cfg.get("passref_enabled", True))
+
+
 def _rescue(result: str, tool_name: str, args: dict | None = None,
             session_id: str = "") -> str | None:
     """Store the result and build the excerpt + handle block.
@@ -340,6 +375,20 @@ def _rescue(result: str, tool_name: str, args: dict | None = None,
         f"blob={blob_id}",
     ]
     header = "[Toolaria: tool result rescued. " + "; ".join(header_fields) + "]"
+    if _passref_active():
+        handle_tail = (
+            f"To feed this whole result into another tool WITHOUT reading "
+            f"it, pass \"tla:{blob_id}\" as that tool's argument; Toolaria "
+            f"expands it to the full content before the tool runs."
+        )
+    else:
+        # Phase 0 (T0.4): pass-by-reference is unavailable (no middleware
+        # OR passref_enabled: false). Advertising a tla:<id> instruction
+        # would be a dead handle — emit rescuer_fetch instructions only.
+        handle_tail = (
+            f"Retrieve the full result with rescuer_fetch(id=\"{blob_id}\", "
+            f"mode=\"full\") or fetch slices with mode=range/grep/outline."
+        )
     return (
         f"{header}\n"
         f"Preview (first {head_lines} / last {tail_lines} lines); "
@@ -351,9 +400,7 @@ def _rescue(result: str, tool_name: str, args: dict | None = None,
         f"  grep     regex match, e.g. mode=\"grep\", pattern=\"<term>\"\n"
         f"  range    lines, e.g. mode=\"range\", start=0, count=20\n"
         f"  stat | full\n"
-        f"To feed this whole result into another tool WITHOUT reading it, pass "
-        f"\"tla:{blob_id}\" as that tool's argument; Toolaria expands it to the "
-        f"full content before the tool runs."
+        f"{handle_tail}"
     )
 
 

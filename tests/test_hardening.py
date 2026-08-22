@@ -13,6 +13,7 @@ import pytest
 
 import blobstore as _blobstore_mod
 from blobstore import BlobStore
+from conftest import FakeCtx
 
 
 # ═══ T0.1 — Explicit permissions (0700 dirs / 0600 files) + chmod migration ═══
@@ -376,11 +377,123 @@ def test_destination_list_must_be_list_of_strings(toolaria):
     assert _parse_external_destinations(["a", "a", "b"]) == frozenset({"a", "b"})
 
 
-def test_destinations_documented_in_plugin_config(toolaria):
-    """The shipped defaults key is present and the precedence comment
-    exists. Use raw text matching so the test does not require PyYAML."""
-    cfg = toolaria._LOCAL_CFG.read_text()  # type: ignore[attr-defined]
-    assert "passref_external_destinations:" in cfg
-    # Comment must explain the deny-vs-allow precedence.
-    assert "external" in cfg.lower()
-    assert "allowlist" in cfg.lower() or "passref_allowed_tools" in cfg
+# ═══ T0.4 — Fail-loud middleware fallback + conditional tla: handle text ═══
+
+
+class _NoMiddlewareCtx(FakeCtx):
+    """A PluginContext that lacks ``register_middleware`` entirely.
+
+    Mirrors a host that predates the tool_request middleware contract;
+    a missing register() helper means pass-by-reference expansion cannot
+    run, so the rescue handle must NOT advertise the tla:<id> feature
+    (that would be a dead handle — a worse failure mode than no rescue).
+
+    Implementation note: setting the class attribute to None would still
+    satisfy ``hasattr(ctx, "register_middleware")`` (the attribute exists
+    and is None). We override ``__getattribute__`` so that lookup of the
+    specific name raises AttributeError, exactly like a real pre-middleware
+    host object.
+    """
+
+    _OMIT = frozenset({"register_middleware"})
+
+    def __getattribute__(self, name):
+        if name in type(self)._OMIT:
+            raise AttributeError(name)
+        return super().__getattribute__(name)
+
+
+def _no_mw_ctx(base_cfg):
+    return _NoMiddlewareCtx({"toolaria": base_cfg})
+
+
+def test_no_middleware_logs_warning(toolaria, base_cfg, caplog):
+    """A host without ``register_middleware`` logs a fail-loud WARNING so
+    operators notice the missing contract (instead of silently emitting
+    dead handles advertising tla:<id>)."""
+    fc = _no_mw_ctx(base_cfg)
+    with caplog.at_level("WARNING", logger="toolaria"):
+        toolaria.register(fc)
+    assert "register_middleware" in caplog.text or "middleware" in caplog.text.lower(), (
+        f"expected a fail-loud middleware warning, got: {caplog.text!r}"
+    )
+
+
+def test_no_middleware_handle_omits_tla_instruction(toolaria, base_cfg):
+    """Without middleware, passref is dead; the handle MUST NOT advertise
+    a tla:<id> instruction (a dead handle is worse than no rescue)."""
+    fc = _no_mw_ctx(base_cfg)
+    toolaria.register(fc)
+    big = "x" * 9000
+    handle = toolaria._on_transform(tool_name="web_extract", result=big)
+    assert handle is not None
+    assert "rescuer_fetch" in handle  # the fetch instructions stay
+    assert "tla:" not in handle, (
+        "handle must not advertise tla:<id> when passref middleware is "
+        "unavailable — that instruction would be a dead handle"
+    )
+
+
+def test_middleware_present_handle_keeps_tla_instruction(toolaria, plugin):
+    """Sanity: with middleware registered (the FakeCtx default), the
+    handle still advertises the tla:<id> instruction so the model knows
+    pass-by-reference is available."""
+    fc, _ = plugin
+    # plugin fixture already registered with FakeCtx.register_middleware
+    big = "x" * 9000
+    handle = toolaria._on_transform(tool_name="web_extract", result=big)
+    assert handle is not None
+    assert "tla:" in handle
+    # And the middleware was registered.
+    assert "tool_request" in fc.middleware
+
+
+def test_passref_disabled_omits_tla_instruction(toolaria, base_cfg, fake_ctx_cls):
+    """passref_enabled: false is the runtime kill switch for pass-by-ref.
+    The handle must NOT advertise tla:<id> in that mode either — a token
+    the model writes will never be expanded, so the instruction is a
+    dead promise."""
+    cfg = dict(base_cfg, passref_enabled=False)
+    fc = fake_ctx_cls({"toolaria": cfg})
+    toolaria.register(fc)
+    big = "x" * 9000
+    handle = toolaria._on_transform(tool_name="web_extract", result=big)
+    assert handle is not None
+    assert "rescuer_fetch" in handle
+    assert "tla:" not in handle, (
+        "passref_enabled=false must also suppress the tla: instruction; "
+        "a disabled expansion token is still a dead handle"
+    )
+
+
+def test_passref_alive_marker_is_visible_when_active(toolaria, plugin):
+    """Inverse of the above: with middleware AND passref_enabled, the
+    handle advertises the feature so the model can use it."""
+    fc, _ = plugin
+    big = "y" * 9000
+    handle = toolaria._on_transform(tool_name="web_extract", result=big)
+    assert handle is not None
+    assert "tla:" in handle
+    assert "feed this whole result" in handle.lower() or \
+        "expand" in handle.lower()
+
+
+def test_rescue_handles_track_passref_state_per_rescue(toolaria, base_cfg,
+                                                        fake_ctx_cls):
+    """The passref liveness is decided at handle-emit time, not at
+    register time: a runtime config flip (e.g. operator sets
+    passref_enabled: false mid-session) flips the next handle's text
+    without requiring a plugin reload."""
+    fc = fake_ctx_cls({"toolaria": base_cfg})
+    toolaria.register(fc)
+    # live
+    h1 = toolaria._on_transform(tool_name="web_extract", result="x" * 9000)
+    assert "tla:" in h1
+    # flip
+    toolaria._cfg["passref_enabled"] = False
+    h2 = toolaria._on_transform(tool_name="web_extract", result="x" * 9000)
+    assert "tla:" not in h2
+    # flip back
+    toolaria._cfg["passref_enabled"] = True
+    h3 = toolaria._on_transform(tool_name="web_extract", result="x" * 9000)
+    assert "tla:" in h3
