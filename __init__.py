@@ -360,7 +360,12 @@ def _rescue(result: str, tool_name: str, args: dict | None = None,
     Returns None (leave the original untouched) unless the blob is durably
     on disk; a handle that cannot be fetched is worse than no rescue."""
     try:
-        blob_id = _store.put(result, tool_name, session_id=session_id)
+        # T1.3: pass the caller's args (already validated as a dict by
+        # the hook contract) so a redacted snapshot lands in the index
+        # entry. Redaction happens inside put() — the rescue path itself
+        # never sees the raw keys/values, which keeps the secret-handling
+        # boundary in one place.
+        blob_id = _store.put(result, tool_name, session_id=session_id, args=args)
     except Exception as exc:
         logger.warning("toolaria: blob write failed for %s: %s", tool_name, exc)
         return None

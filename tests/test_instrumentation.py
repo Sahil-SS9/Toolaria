@@ -14,7 +14,6 @@ import blobstore as _blobstore_mod
 from blobstore import BlobStore
 from reporting import reacquisition_report as _rr
 
-
 # ═══ T1.1 — first_fetch_ts + fetch_count persisted on fetch ══════════════
 
 
@@ -290,3 +289,122 @@ class TestSequenceSidecar:
         toolaria._store._record_sequence("abc123456789", "s1", time.time(), None)
         # And the fetch path must not raise either.
         toolaria._fetch(args={"id": bid, "mode": "stat"}, session_id="s1")
+
+
+# ═══ T1.3 — args provenance, secret redaction, size cap ═════════════════
+
+
+import hashlib as _hashlib  # noqa: E402  (local to T1.3 cluster)
+
+
+class TestArgsProvenance:
+    """T1.3: redacted args snapshot in the index entry."""
+
+    def test_args_absent_produces_null_provenance(self, plugin, toolaria):
+        bid = toolaria._store.put("data", "web_search", session_id="s1")
+        entry = toolaria._store._load_idx("s1")["blobs"][bid]
+        assert "args_snapshot" in entry
+        assert entry["args_snapshot"] is None
+
+    def test_args_stored_when_provided(self, plugin, toolaria):
+        args = {"url": "https://example.com", "depth": 2}
+        bid = toolaria._store.put("data", "web_search", session_id="s1",
+                                  args=args)
+        entry = toolaria._store._load_idx("s1")["blobs"][bid]
+        assert entry["args_snapshot"], (
+            "args_snapshot must be non-empty when args provided"
+        )
+        assert "https://example.com" in entry["args_snapshot"]
+
+    def test_secret_keys_redacted(self, plugin, toolaria):
+        args = {"api_key": "sk-abcdefgh12345678", "url": "https://example.com"}
+        bid = toolaria._store.put("data", "web_search", session_id="s1",
+                                  args=args)
+        snap = toolaria._store._load_idx("s1")["blobs"][bid]["args_snapshot"]
+        assert "sk-abcdefgh12345678" not in snap, (
+            "secret value stored verbatim; redaction failed"
+        )
+        assert "[REDACTED]" in snap
+
+    def test_secret_keys_redacted_various_names(self, plugin, toolaria):
+        cases = [
+            {"token": "leak-me", "x": 1},
+            {"password": "leak-me", "x": 1},
+            {"authorization": "leak-me", "x": 1},
+            {"bearer": "leak-me", "x": 1},
+            {"secret": "leak-me", "x": 1},
+            {"API_KEY": "leak-me", "x": 1},
+            {"X-Api-Key": "leak-me", "x": 1},
+        ]
+        for args in cases:
+            bid = toolaria._store.put("d", "web_search", session_id="s1",
+                                      args=args)
+            snap = toolaria._store._load_idx("s1")["blobs"][bid]["args_snapshot"]
+            assert "leak-me" not in snap, (
+                f"value not redacted for key in {args!r}; snap={snap!r}"
+            )
+
+    def test_secret_value_pattern_redacted(self, plugin, toolaria):
+        """A sk-... or bearer ... value is masked regardless of key."""
+        args = {"url": "https://x.test?key=sk-abcdefgh12345678"}
+        bid = toolaria._store.put("d", "web_search", session_id="s1", args=args)
+        snap = toolaria._store._load_idx("s1")["blobs"][bid]["args_snapshot"]
+        assert "sk-abcdefgh12345678" not in snap
+        bid2 = toolaria._store.put("d", "web_search", session_id="s1",
+                                   args={"h": "bearer eyJabcdefghij"})
+        snap2 = toolaria._store._load_idx("s1")["blobs"][bid2]["args_snapshot"]
+        assert "eyJabcdefghij" not in snap2
+
+    def test_nested_args_redacted(self, plugin, toolaria):
+        args = {"outer": {"api_key": "sk-abcdefgh12345678", "ok": 1},
+                "list": [{"token": "sk-aaaaaaaaaaaaaa"}]}
+        bid = toolaria._store.put("d", "web_search", session_id="s1", args=args)
+        snap = toolaria._store._load_idx("s1")["blobs"][bid]["args_snapshot"]
+        assert "sk-abcdefgh12345678" not in snap
+        assert "sk-aaaaaaaaaaaaaa" not in snap
+        assert "ok" in snap and "1" in snap
+
+    def test_size_cap_truncates_snapshot(self, plugin, toolaria):
+        toolaria._store.cfg["args_snapshot_max_chars"] = 200
+        args = {"big": "x" * 5000, "more": "y" * 5000}
+        bid = toolaria._store.put("d", "web_search", session_id="s1", args=args)
+        snap = toolaria._store._load_idx("s1")["blobs"][bid]["args_snapshot"]
+        assert len(snap) <= 200 + 100  # truncation marker adds a few chars
+        assert "truncated" in snap
+
+    def test_result_hash_unchanged_by_args(self, plugin, toolaria):
+        """Redaction only touches the index entry; the blob_id is unchanged."""
+        content = "stable-content-for-hash-1"
+        args = {"api_key": "sk-abcdefgh12345678"}
+        b1 = toolaria._store.put(content, "web_search", session_id="s1")
+        b2 = toolaria._store.put(content, "web_search", session_id="s1", args=args)
+        b3 = toolaria._store.put(content, "web_search", session_id="s1", args=None)
+        assert b1 == b2 == b3
+        # And the recorded hash matches the actual content.
+        expected = _hashlib.sha256(content.encode("utf-8")).hexdigest()
+        assert toolaria._store._load_idx("s1")["blobs"][b1]["hash"] == expected
+
+    def test_args_provenance_via_rescue(self, plugin, toolaria):
+        """The full rescue path persists the snapshot, not just direct put()."""
+        r = toolaria._on_transform(
+            tool_name="web_extract",
+            result="x" * 9000,
+            args={"url": "https://x.test", "api_key": "sk-abcdefgh12345678"},
+            session_id="s1",
+        )
+        assert r is not None
+        # Pull the index entry for the session — should have an args_snapshot
+        # with the url preserved and the secret redacted.
+        idx = toolaria._store._load_idx("s1")
+        snap = next(iter(idx["blobs"].values()))["args_snapshot"]
+        assert "https://x.test" in snap
+        assert "sk-abcdefgh12345678" not in snap
+
+    def test_max_chars_zero_disables_capture(self, plugin, toolaria):
+        toolaria._store.cfg["args_snapshot_max_chars"] = 0
+        bid = toolaria._store.put("d", "web_search", session_id="s1",
+                                  args={"url": "https://x.test"})
+        entry = toolaria._store._load_idx("s1")["blobs"][bid]
+        assert entry["args_snapshot"] is None, (
+            "max_chars=0 must be a benchmark-only escape hatch (no capture)"
+        )

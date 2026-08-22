@@ -22,6 +22,67 @@ except ImportError:
     from chunking import chunk_lines as _chunk_lines  # type: ignore[no-redef]
     import semantic as _sem  # type: ignore[no-redef]
 
+
+# ── Phase 1 helpers (T1.3 redaction) ─────────────────────────────────────
+
+# Secret-key name pattern (matches by key, case-insensitive): any field whose
+# name looks like an API key / token / password / bearer / secret must be
+# scrubbed BEFORE the args snapshot lands in the index.
+_SECRET_KEY_RE = re.compile(
+    r"(?i)\b(api[_-]?key|token|password|authorization|bearer|secret)\b"
+)
+# Secret-value pattern (matches the literal text, regardless of key):
+# - sk-XXXXXXX (8+ alphanumerics after the prefix) — common API key shapes
+# - "bearer <token>" — Authorization headers leaking into args
+_SECRET_VALUE_RE = re.compile(
+    r"sk-[A-Za-z0-9]{8,}|bearer\s+\S+", re.IGNORECASE
+)
+_REDACTED = "[REDACTED]"
+
+
+def _redact_args_snapshot(args, max_chars: int):
+    """Produce a JSON-serializable, redaction-safe snapshot of *args*.
+
+    Recurses through dicts/lists; values whose KEY matches a secret
+    pattern are replaced with the REDACTED marker, and any string VALUE
+    that matches a secret pattern (sk-… or bearer …) is also masked
+    regardless of its key. The result is truncated to ``max_chars``.
+
+    None or empty args return None (null provenance). Non-JSON-native
+    values fall back to ``repr``; an unserializable input becomes an
+    empty dict so a broken tool never blocks a rescue.
+    """
+    if args is None:
+        return None
+    try:
+        snap = _scrub(args)
+        text = json.dumps(snap, sort_keys=True, default=repr, ensure_ascii=False)
+    except Exception:
+        return {}
+    if len(text) > max_chars:
+        text = text[:max_chars] + f"\n[Toolaria: args_snapshot truncated at {max_chars} chars]"
+    return text
+
+
+def _scrub(value):
+    """Recursively redact *value* in-place-ish (returns a new container)."""
+    if isinstance(value, dict):
+        out = {}
+        for k, v in value.items():
+            key = str(k)
+            if _SECRET_KEY_RE.search(key):
+                out[key] = _REDACTED
+            else:
+                out[key] = _scrub(v)
+        return out
+    if isinstance(value, list):
+        return [_scrub(v) for v in value]
+    if isinstance(value, tuple):
+        return [_scrub(v) for v in value]
+    if isinstance(value, str):
+        return _SECRET_VALUE_RE.sub(_REDACTED, value)
+    return value
+
 _LOCK = threading.Lock()
 _BLOB_ID_RE = re.compile(r"^[0-9a-f]{12}$")
 
@@ -255,11 +316,20 @@ class BlobStore:
 
     # ── blob i/o ──────────────────────────
 
-    def put(self, content: str, tool_name: str = "", session_id: str = "") -> str:
+    def put(self, content: str, tool_name: str = "", session_id: str = "",
+            args=None) -> str:
         """Store content, return short blob_id (first 12 hex of SHA256).
 
         *session_id* is the owning session; callers must pass it so the
-        per-session index stays correct under concurrent sessions."""
+        per-session index stays correct under concurrent sessions.
+
+        *args* (T1.3) is the caller's tool args; if provided, a redacted
+        snapshot is persisted into the index entry under
+        ``args_snapshot`` so a future rescuer can audit which inputs
+        produced a blob. The content hash is unaffected — redaction only
+        touches metadata. ``args_snapshot_max_chars`` caps the snapshot
+        length; pass ``args_snapshot_max_chars=0`` to disable capture
+        even when args is provided (benchmark-only escape hatch)."""
         if isinstance(content, str):
             raw = content.encode("utf-8")
         else:
@@ -268,6 +338,13 @@ class BlobStore:
         bid = bhash[:12]
         bpath = self.blob_dir / bid
         sid = session_id or "unknown"
+        # T1.3: redact args BEFORE storage; hash equality of the content
+        # bytes is unaffected because we only touch the index entry.
+        max_chars = int(self.cfg.get("args_snapshot_max_chars", 2000))
+        if max_chars <= 0:
+            args_snapshot = None
+        else:
+            args_snapshot = _redact_args_snapshot(args, max_chars)
         with _LOCK:
             if not bpath.exists():
                 bpath.write_bytes(raw)
@@ -279,6 +356,7 @@ class BlobStore:
                 "tool": tool_name,
                 "size": len(raw),
                 "hash": bhash,
+                "args_snapshot": args_snapshot,
             }
             self._save_idx(idx, sid)
         return bid
