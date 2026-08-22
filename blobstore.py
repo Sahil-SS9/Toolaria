@@ -1,6 +1,7 @@
 """SHA256-addressed blob store for rescued tool results. Global keys, per-session indexes."""
 import hashlib
 import json
+import logging
 import os
 import re
 import tempfile
@@ -23,6 +24,45 @@ except ImportError:
 
 _LOCK = threading.Lock()
 _BLOB_ID_RE = re.compile(r"^[0-9a-f]{12}$")
+
+# Phase 0 hardening (T0.1): explicit perms on every file/dir created by the
+# store. mkdir and write_bytes honour umask, so a permissive umask (or a
+# pre-existing tree left by an older install) would otherwise leak blobs at
+# world-readable. Setting the mode explicitly after every create makes the
+# guarantee independent of umask and of installation history.
+_DIR_MODE = 0o700
+_FILE_MODE = 0o600
+
+logger = logging.getLogger(__name__)
+
+
+def _chmod_safe(path, mode: int) -> bool:
+    """Best-effort chmod that logs and swallows permission errors.
+
+    Returns True on success, False on failure. A chmod failure (e.g. a
+    read-only mount, an immutable file, or an unsupported platform) must
+    never crash store init: the store is still usable, just without the
+    perm tightening. The warning makes the gap visible for the operator.
+    """
+    try:
+        os.chmod(path, mode)
+        return True
+    except OSError as exc:
+        logger.warning("toolaria: chmod %s to 0o%o failed: %s", path, mode, exc)
+        return False
+
+
+def _tighten_perms(root: Path, mode: int) -> None:
+    """Walk *root* (a dir) and chmod every dir/file under it to *mode*.
+
+    Used for init-time migration of older permissive stores (0755 dirs,
+    0644 files). Failures on individual entries are swallowed (logged by
+    _chmod_safe); migration is best-effort.
+    """
+    for dirpath, dirnames, filenames in os.walk(root):
+        _chmod_safe(Path(dirpath), _DIR_MODE)
+        for name in filenames:
+            _chmod_safe(Path(dirpath) / name, mode)
 
 # The grep engine. Arbitrary user regex against adversarial blob content is a
 # ReDoS hazard that no static denylist fully closes (e.g. a*a*a*...X or
@@ -49,12 +89,24 @@ class BlobStore:
     def __init__(self, cfg: dict):
         self.cfg = cfg
         bp = Path(cfg.get("store_path", "~/.hermes/toolaria")).expanduser().resolve()
+        # Create root first so the subsequent sub-dir mkdirs do not need
+        # parents=True (and thus skip the root chmod below).
+        bp.mkdir(parents=True, exist_ok=True)
+        _chmod_safe(bp, _DIR_MODE)
         self.blob_dir = bp / "blobs"
         self.meta_dir = bp / "sessions"
         self.sidecar_dir = bp / "sidecars"
-        self.blob_dir.mkdir(parents=True, exist_ok=True)
-        self.meta_dir.mkdir(parents=True, exist_ok=True)
-        self.sidecar_dir.mkdir(parents=True, exist_ok=True)
+        self.blob_dir.mkdir(exist_ok=True)
+        self.meta_dir.mkdir(exist_ok=True)
+        self.sidecar_dir.mkdir(exist_ok=True)
+        for d in (self.blob_dir, self.meta_dir, self.sidecar_dir):
+            _chmod_safe(d, _DIR_MODE)
+        # Migration: tighten any older permissive tree the install may have
+        # left behind (0755 dirs / 0644 files). Best-effort; chmod failures
+        # are logged but do not stop init.
+        _tighten_perms(self.blob_dir, _FILE_MODE)
+        _tighten_perms(self.meta_dir, _FILE_MODE)
+        _tighten_perms(self.sidecar_dir, _FILE_MODE)
         # Hot-blob tracking: in-memory fetch log keyed by (safe_sid, blob_id).
         # Records fetch timestamps; recency-weighted count computed during sweep.
         # Persisted to index entries during sweep; reloaded on init.
@@ -88,6 +140,7 @@ class BlobStore:
             with os.fdopen(fd, "w") as f:
                 json.dump(data, f)
             os.replace(tmp, p)
+            _chmod_safe(p, _FILE_MODE)
         except Exception:
             try:
                 os.unlink(tmp)
@@ -216,6 +269,7 @@ class BlobStore:
         with _LOCK:
             if not bpath.exists():
                 bpath.write_bytes(raw)
+                _chmod_safe(bpath, _FILE_MODE)
             idx = self._load_idx(sid)
             idx.setdefault("blobs", {})
             idx["blobs"][bid] = {
@@ -693,6 +747,7 @@ class BlobStore:
             with os.fdopen(fd, "w") as f:
                 json.dump(idx, f)
             os.replace(tmp, path)
+            _chmod_safe(path, _FILE_MODE)
         except Exception:
             try:
                 os.unlink(tmp)
