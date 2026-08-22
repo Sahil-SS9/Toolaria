@@ -112,6 +112,8 @@ class BlobStore:
         # Persisted to index entries during sweep; reloaded on init.
         self._fetch_log: dict[tuple[str, str], list[float]] = {}
         self._load_fetch_log()
+        # T1.2: sequences sidecar lazily created on first write when enabled.
+        self._sequences_dir = bp / "sequences"
 
     # ── sidecars (per-blob index/vector artefacts) ──
 
@@ -281,7 +283,8 @@ class BlobStore:
             self._save_idx(idx, sid)
         return bid
 
-    def _refresh_blob(self, blob_id: str, session_id: str) -> None:
+    def _refresh_blob(self, blob_id: str, session_id: str,
+                       turn: int | None = None) -> None:
         """Bump the access time of a blob's index entry so a result the model
         is still fetching survives the next TTL sweep.
 
@@ -327,6 +330,41 @@ class BlobStore:
         # Trim entries older than 7 days to bound memory.
         cutoff = now - 604800
         self._fetch_log[key] = [t for t in self._fetch_log[key] if t > cutoff]
+        # T1.2: sequence sidecar (default OFF; see config.yaml).
+        self._record_sequence(blob_id, session_id, now, turn)
+
+    def _sequences_path(self) -> "Path | None":
+        """Return the JSONL sidecar path, or None when capture is disabled."""
+        if not self.cfg.get("sequence_capture", False):
+            return None
+        return self._sequences_dir / "events.jsonl"
+
+    def _record_sequence(self, blob_id: str, session_id: str, now: float,
+                          turn: int | None) -> None:
+        """Append one JSONL event to the T1.2 sidecar if enabled.
+
+        Best-effort: a write failure is logged at DEBUG but never raises,
+        because the fetch path must not be broken by an audit-trail I/O
+        hiccup. Ordering is preserved (open with ``a`` append mode, single
+        line per write) so reload-by-line rebuilds the original sequence."""
+        path = self._sequences_path()
+        if path is None:
+            return
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            _chmod_safe(path.parent, _DIR_MODE)
+            record: dict = {
+                "ts": now,
+                "sid": session_id,
+                "blob_id": blob_id,
+            }
+            if turn is not None:
+                record["turn"] = turn
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(record, sort_keys=True) + "\n")
+            _chmod_safe(path, _FILE_MODE)
+        except Exception as exc:
+            logger.debug("toolaria: sequence append failed: %s", exc)
 
     def _tombstone_msg(self, blob_id: str, session_id: str = "") -> str | None:
         """Return model-facing guidance if the blob was swept but a tombstone

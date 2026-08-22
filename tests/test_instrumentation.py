@@ -207,3 +207,86 @@ class TestConfigAndIntegration:
         assert c.get("sequence_capture") is False
         assert c.get("args_snapshot_max_chars") == 2000
         assert c.get("verify_integrity") is True
+
+
+# ═══ T1.2 — JSONL sequence sidecar, default OFF ═════════════════════════
+
+
+class TestSequenceSidecar:
+    """T1.2: store_path/sequences/events.jsonl; one line per fetch."""
+
+    def test_default_off_writes_nothing(self, plugin, toolaria):
+        bid = toolaria._store.put("data", "web_search", session_id="s1")
+        toolaria._fetch(args={"id": bid, "mode": "stat"}, session_id="s1")
+        seq_dir = toolaria._store.blob_dir.parent / "sequences"
+        assert not seq_dir.exists() or not any(seq_dir.glob("*.jsonl")), (
+            "sequence_capture must default OFF ⇒ no sidecar file or dir"
+        )
+
+    def test_enabled_appends_one_line_per_fetch(self, plugin, toolaria):
+        toolaria._store.cfg["sequence_capture"] = True
+        bid = toolaria._store.put("data", "web_search", session_id="s1")
+        for _ in range(3):
+            toolaria._fetch(args={"id": bid, "mode": "stat"}, session_id="s1")
+        path = toolaria._store.blob_dir.parent / "sequences" / "events.jsonl"
+        assert path.exists()
+        lines = [ln for ln in path.read_text().splitlines() if ln.strip()]
+        assert len(lines) == 3, f"expected 3 events, got {len(lines)}"
+        for ln in lines:
+            ev = json.loads(ln)
+            assert set(ev) == {"ts", "sid", "blob_id"}
+            assert ev["blob_id"] == bid
+            assert ev["sid"] == "s1"
+
+    def test_ordering_preserved_across_reload(self, plugin, toolaria, tmp_path):
+        """Write N events, then read them back in the same order.
+
+        Reused by the T1.2 'N-event fixture' matrix requirement."""
+        toolaria._store.cfg["sequence_capture"] = True
+        bids = [toolaria._store.put(f"data{i}", "web_search",
+                                     session_id="s1") for i in range(5)]
+        for bid in bids:
+            toolaria._fetch(args={"id": bid, "mode": "stat"}, session_id="s1")
+        path = toolaria._store.blob_dir.parent / "sequences" / "events.jsonl"
+        seen = [json.loads(ln)["blob_id"] for ln in
+                path.read_text().splitlines() if ln.strip()]
+        assert seen == bids, (
+            f"ordering not preserved: wrote {bids!r}, read {seen!r}"
+        )
+
+    def test_turn_field_included_when_provided(self, plugin, toolaria):
+        toolaria._store.cfg["sequence_capture"] = True
+        bid = toolaria._store.put("data", "web_search", session_id="s1")
+        # Direct path: invoke the recorder with a turn counter.
+        toolaria._store._record_sequence(bid, "s1", time.time(), turn=7)
+        path = toolaria._store.blob_dir.parent / "sequences" / "events.jsonl"
+        ev = json.loads(path.read_text().splitlines()[-1])
+        assert ev.get("turn") == 7
+
+    def test_turn_field_absent_when_none(self, plugin, toolaria):
+        toolaria._store.cfg["sequence_capture"] = True
+        toolaria._store._record_sequence("abc123456789", "s1", time.time(), None)
+        path = toolaria._store.blob_dir.parent / "sequences" / "events.jsonl"
+        ev = json.loads(path.read_text().splitlines()[-1])
+        assert "turn" not in ev
+
+    def test_append_failure_does_not_break_fetch(
+        self, plugin, toolaria, monkeypatch
+    ):
+        toolaria._store.cfg["sequence_capture"] = True
+        # Pre-create a bid so the fetch path can succeed.
+        bid = toolaria._store.put("data", "web_search", session_id="s1")
+        # Now monkey-patch open() to raise on the events.jsonl path; the
+        # recorder's try/except must swallow it.
+        real_open = open
+
+        def selective_open(p, *a, **kw):
+            if str(p).endswith("events.jsonl"):
+                raise OSError("disk gone")
+            return real_open(p, *a, **kw)
+
+        monkeypatch.setattr("builtins.open", selective_open)
+        # Direct recorder call must not raise.
+        toolaria._store._record_sequence("abc123456789", "s1", time.time(), None)
+        # And the fetch path must not raise either.
+        toolaria._fetch(args={"id": bid, "mode": "stat"}, session_id="s1")
