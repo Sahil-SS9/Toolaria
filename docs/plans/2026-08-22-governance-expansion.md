@@ -1,6 +1,7 @@
 # Toolaria Governance Expansion — Implementation Plan
 
 > **Status:** APPROVED by Sahil 2026-08-22. Decisions locked: (1) proceed; (2) public promotion (T5.5) additionally gated on full build + thorough test completion, not merely feature-complete; (3) simplified capability/direction summary delivered in chat.
+> **Hold (2026-08-22, Sahil):** Phases 1–4 ON HOLD pending the Phase 0 48h dogfood gate cron output (job f5ad03c493cb, due 2026-08-24 ~12:15 BST). Phase 1 dispatch requires an explicit PASS from that gate.
 > **Evidence base:** Triple-verified review 2026-08-22 (direct source reads, security threat-model review, independent code review, research validation). Zero unresolved contradictions.
 
 **Goal:** Evolve Toolaria from a size-only context-rescue plugin into the fleet's data-governance chokepoint: hardened defaults, measured behaviour, sensitivity-aware value-flow auditing, and risk-tiered pre-execution entity binding.
@@ -104,20 +105,22 @@
 Update immediately after each item changes state — same working turn, never batched.
 
 Phase 0 — Hardening
-- [ ] T0.1 Explicit 0700/0600 permissions (+ existing-store chmod migration)
-- [ ] T0.2 Shell/write-class tools in `_UNCONDITIONAL_EXCLUDES`
-- [ ] T0.3 `passref_external_destinations` deny list
-- [ ] T0.4 Fail-loud middleware fallback + conditional `tla:` handle text
-- [ ] T0.5 Chain mode in schema/docs + ARCHITECTURE.md drift fix
-- [ ] P0 exit: suite green, perms verified, 48h dogfood clean
+- [x] T0.1 Explicit 0700/0600 permissions (+ existing-store chmod migration) — commit 9ce98a5
+- [x] T0.2 Shell/write-class tools in `_UNCONDITIONAL_EXCLUDES` — commit 9f0edc6
+- [x] T0.3 `passref_external_destinations` deny list — commit d9c4459
+- [x] T0.4 Fail-loud middleware fallback + conditional `tla:` handle text — commit eaa7c5a
+- [x] T0.5 Chain mode in schema/docs + ARCHITECTURE.md drift fix — commit 658c246
+- [~] P0 exit: suite green ✅, perms verified ✅, functional probe ✅ — 48h dogfood PENDING (cron f5ad03c493cb, due 2026-08-24 ~12:15 BST)
+
+> **Authorisation note (2026-08-22, Sahil):** Phase 1 BUILD may proceed immediately on current evidence; DEPLOYMENT of Phase 1 remains gated on the Phase 0 cron PASS. Sunday output verifies the approach and forces amendments if needed.
 
 Phase 1 — Instrumentation
-- [ ] T1.1 Timestamp-proxy reacquisition metrics + report script
-- [ ] T1.2 Sequence capture (turn-position, gated) + degraded-mode reporting
-- [ ] T1.3 Args provenance with caps + secret-redaction
-- [ ] T1.4 Full-hash integrity verify on fetch
-- [ ] T1.5 JSONL expansion audit ledger (INFO)
-- [ ] P1 exit: baseline numbers recorded, ledger in dogfood
+- [x] T1.1 Timestamp-proxy reacquisition metrics + report script — commit 163f07b
+- [x] T1.2 Sequence capture (turn-position, gated) + degraded-mode reporting — commit fec9da1
+- [x] T1.3 Args provenance with caps + secret-redaction — commit 4a53f12
+- [x] T1.4 Full-hash integrity verify on fetch — commit f73f3c9
+- [x] T1.5 JSONL expansion audit ledger (INFO) — commit c3f6cdb
+- [~] P1 exit: implementation complete (44 new tests, 172 total green); baseline numbers + dogfood ledger recording are gated on Phase 0 cron PASS (job f5ad03c493cb) before deploy
 
 Phase 2 — Data-governance core
 - [ ] T2.1 Sensitivity labels (tombstone-safe, size-sweep-aware)
