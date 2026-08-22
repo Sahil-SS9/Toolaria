@@ -16,11 +16,21 @@ classes by name. This deny list is NEVER merged into ``exclude_tools`` (those
 tools' oversized results must still be rescued — passref just refuses the
 cross-tool handoff) and overrides ``passref_allowed_tools`` when both name a
 tool: an operator's permissive allowlist cannot re-enable an external send.
+
+Phase 1 instrumentation (T1.5): every terminal expansion outcome is
+appended to a JSONL audit ledger at ``store_path/ledger/expansions.jsonl``.
+A failure to write the audit line is logged at WARNING but NEVER raises
+into the expansion path — observability must not break delivery.
 """
 from __future__ import annotations
 
 import logging
 import re
+
+try:
+    from .ledger import log_expansion as _log_expansion
+except ImportError:
+    from ledger import log_expansion as _log_expansion  # type: ignore[no-redef]
 
 logger = logging.getLogger(__name__)
 
@@ -186,9 +196,17 @@ def _expand_string(text: str, store, cfg: dict, stats: dict,
 
     def _sub(m: re.Match) -> str:
         if denied:
+            # T1.5: every token denied by the destination-deny list emits
+            # exactly one ledger line. The call is best-effort and never
+            # raises into the expansion path.
+            _log_expansion(cfg, sid=session_id, blob_id=m.group(1),
+                           dst_tool=tool_name, chars=0, decision="dest_denied")
             return _DEST_DENY_MARKER_PREFIX
         blob_id = m.group(1)
         if stats.get("total", 0) >= total_cap:
+            _log_expansion(cfg, sid=session_id, blob_id=blob_id,
+                           dst_tool=tool_name, chars=0,
+                           decision="budget_capped")
             return f"[Toolaria: total expansion budget {total_cap:,} chars exceeded]"
         # Session scoping: when the host forwards a session_id, a blob the
         # calling session does not reference is refused (it belongs to, or was
@@ -197,10 +215,15 @@ def _expand_string(text: str, store, cfg: dict, stats: dict,
         # single-session setups work, mirroring fetch's all-session fallback.
         if session_id and store and not store.session_references(blob_id, session_id):
             stats["denied"] = stats.get("denied", 0) + 1
+            _log_expansion(cfg, sid=session_id, blob_id=blob_id,
+                           dst_tool=tool_name, chars=0,
+                           decision="session_denied")
             return f"[Toolaria: blob {blob_id} not available in this session]"
         content = store.blob_text(blob_id) if store else None
         if content is None:
             stats["missing"] = stats.get("missing", 0) + 1
+            _log_expansion(cfg, sid=session_id, blob_id=blob_id,
+                           dst_tool=tool_name, chars=0, decision="missing")
             return f"[Toolaria: blob {blob_id} unavailable; re-run the source tool]"
         if len(content) > cap:
             content = (content[:cap] +
@@ -208,6 +231,9 @@ def _expand_string(text: str, store, cfg: dict, stats: dict,
                        f"> passref_max_chars {cap:,}]")
         stats["expanded"] = stats.get("expanded", 0) + 1
         stats["total"] = stats.get("total", 0) + len(content)
+        _log_expansion(cfg, sid=session_id, blob_id=blob_id,
+                       dst_tool=tool_name, chars=len(content),
+                       decision="expanded")
         return content
 
     return TOKEN_RE.sub(_sub, text), denied

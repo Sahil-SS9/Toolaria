@@ -494,3 +494,102 @@ class TestIntegrityVerify:
         # catch quadratic regressions, not microbenchmark.
         assert "lines 0..0" in r, f"unexpected range output: {r[:200]!r}"
         assert elapsed < 3.0, f"verify+range on 3MB took {elapsed:.2f}s (bound 3s)"
+
+
+# ═══ T1.5 — expansion audit ledger ══════════════════════════════════════
+
+
+def _read_ledger(store_path: Path) -> list[dict]:
+    p = store_path / "ledger" / "expansions.jsonl"
+    if not p.exists():
+        return []
+    return [json.loads(ln) for ln in p.read_text().splitlines() if ln.strip()]
+
+
+class TestExpansionLedger:
+    """T1.5: every terminal outcome writes exactly one JSONL line."""
+
+    def test_expanded_emits_one_line(self, plugin, toolaria):
+        bid = toolaria._store.put("PAYLOAD " * 100, "web_extract",
+                                   session_id="s1")
+        mw = plugin[0].middleware["tool_request"][0]
+        mw(tool_name="summarise", args={"x": f"tla:{bid}"})
+        rows = _read_ledger(Path(toolaria._store.cfg["store_path"]))
+        assert len(rows) == 1
+        r = rows[0]
+        assert r["decision"] == "expanded"
+        assert r["blob_id"] == bid
+        assert r["dst_tool"] == "summarise"
+        assert r["chars"] > 0
+        assert r["sid"] == ""
+
+    def test_dest_denied_emits_one_line(self, plugin, toolaria):
+        bid = toolaria._store.put("SECRET " * 50, "web_extract",
+                                   session_id="s1")
+        mw = plugin[0].middleware["tool_request"][0]
+        mw(tool_name="send_email", args={"body": f"tla:{bid}"})
+        rows = _read_ledger(Path(toolaria._store.cfg["store_path"]))
+        assert len(rows) == 1 and rows[0]["decision"] == "dest_denied"
+
+    def test_session_denied_emits_one_line(self, plugin, toolaria):
+        bid = toolaria._store.put("DATA", "web_extract", session_id="owner")
+        mw = plugin[0].middleware["tool_request"][0]
+        mw(tool_name="t", args={"x": f"tla:{bid}"}, session_id="intruder")
+        rows = _read_ledger(Path(toolaria._store.cfg["store_path"]))
+        assert len(rows) == 1 and rows[0]["decision"] == "session_denied"
+
+    def test_missing_emits_one_line(self, plugin, toolaria):
+        mw = plugin[0].middleware["tool_request"][0]
+        mw(tool_name="t", args={"x": "tla:000000000000"})
+        rows = _read_ledger(Path(toolaria._store.cfg["store_path"]))
+        assert len(rows) == 1 and rows[0]["decision"] == "missing"
+
+    def test_budget_capped_emits_one_line(self, plugin, toolaria):
+        toolaria._cfg["passref_total_max_chars"] = 500
+        bid = toolaria._store.put("z" * 800, "web_extract", session_id="s1")
+        mw = plugin[0].middleware["tool_request"][0]
+        mw(tool_name="t", args={"a": f"tla:{bid}", "b": f"tla:{bid}"})
+        rows = _read_ledger(Path(toolaria._store.cfg["store_path"]))
+        decisions = [r["decision"] for r in rows]
+        assert decisions == ["expanded", "budget_capped"], (
+            f"first token expands, second hits budget; got {decisions!r}"
+        )
+
+    def test_each_line_is_well_formed(self, plugin, toolaria):
+        """Every emitted line is parseable JSON with the contracted schema."""
+        bid = toolaria._store.put("X", "web_extract", session_id="s1")
+        mw = plugin[0].middleware["tool_request"][0]
+        mw(tool_name="t", args={"x": f"tla:{bid}"})
+        rows = _read_ledger(Path(toolaria._store.cfg["store_path"]))
+        for r in rows:
+            assert set(r) == {"ts", "sid", "blob_id", "dst_tool", "chars",
+                              "decision"}, f"unexpected keys: {set(r)}"
+            assert r["decision"] in {
+                "expanded", "dest_denied", "session_denied",
+                "missing", "budget_capped",
+            }
+
+    def test_no_token_no_ledger_line(self, plugin, toolaria):
+        mw = plugin[0].middleware["tool_request"][0]
+        out = mw(tool_name="t", args={"x": "plain text"})
+        assert out is None
+        rows = _read_ledger(Path(toolaria._store.cfg["store_path"]))
+        assert rows == [], (
+            "a token-less call must not produce a ledger line"
+        )
+
+    def test_ledger_append_failure_does_not_break_expansion(
+        self, plugin, toolaria, monkeypatch
+    ):
+        """An audit-trail I/O hiccup must NEVER break the expansion."""
+        import ledger as _ledger_mod
+        def fake_append(path, record):
+            raise OSError("disk gone")
+        monkeypatch.setattr(_ledger_mod, "append_line", fake_append)
+        bid = toolaria._store.put("DATA " * 50, "web_extract",
+                                   session_id="s1")
+        mw = plugin[0].middleware["tool_request"][0]
+        # Expansion must still succeed.
+        out = mw(tool_name="summarise", args={"x": f"tla:{bid}"})
+        assert out is not None
+        assert "DATA" in out["args"]["x"]
