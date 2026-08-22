@@ -36,8 +36,12 @@ INTEGRITY_FAIL_MARKER_SUFFIX = "; content does not match index hash]"
 # Secret-key name pattern (matches by key, case-insensitive): any field whose
 # name looks like an API key / token / password / bearer / secret must be
 # scrubbed BEFORE the args snapshot lands in the index.
+# Boundaries are letter-only lookarounds, NOT \b: underscore counts as a word
+# character, so \btoken\b cannot match inside access_token / refresh_token /
+# client_secret — exactly the snake_case shapes real APIs use. The lookarounds
+# still reject benign lookalikes (tokenizer: 'token' + 'i'; keynote: no hit).
 _SECRET_KEY_RE = re.compile(
-    r"(?i)\b(api[_-]?key|token|password|authorization|bearer|secret)\b"
+    r"(?i)(?<![A-Za-z])(api[_-]?key|token|password|authorization|bearer|secret)(?![A-Za-z])"
 )
 # Secret-value pattern (matches the literal text, regardless of key):
 # - sk-XXXXXXX (8+ alphanumerics after the prefix) — common API key shapes

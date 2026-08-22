@@ -335,6 +335,13 @@ class TestArgsProvenance:
             {"secret": "leak-me", "x": 1},
             {"API_KEY": "leak-me", "x": 1},
             {"X-Api-Key": "leak-me", "x": 1},
+            # Snake_case variants: \b cannot match across underscores, so the
+            # regex must handle these without word boundaries (T1.3 defect fix).
+            {"access_token": "leak-me", "x": 1},
+            {"client_secret": "leak-me", "x": 1},
+            {"refresh_token": "leak-me", "x": 1},
+            {"My_Secret_Value": "leak-me", "x": 1},
+            {"user_password_hash": "leak-me", "x": 1},
         ]
         for args in cases:
             bid = toolaria._store.put("d", "web_search", session_id="s1",
