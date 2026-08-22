@@ -23,7 +23,15 @@ except ImportError:
     import semantic as _sem  # type: ignore[no-redef]
 
 
-# ── Phase 1 helpers (T1.3 redaction) ─────────────────────────────────────
+# ── Phase 1 helpers (T1.3 redaction, T1.4 integrity marker) ─────────────
+
+# Deterministic marker returned (and logged) when fetch-time integrity verify
+# fails. Exact string is part of the T1.4 contract — the test matrix asserts
+# the literal shape, and downstream parsers may key off the prefix.
+INTEGRITY_FAIL_MARKER_PREFIX = (
+    "[Toolaria: integrity check failed for blob "
+)
+INTEGRITY_FAIL_MARKER_SUFFIX = "; content does not match index hash]"
 
 # Secret-key name pattern (matches by key, case-insensitive): any field whose
 # name looks like an API key / token / password / bearer / secret must be
@@ -542,6 +550,28 @@ class BlobStore:
             # Swept by a concurrent sweep between the existence check and read.
             return (self._tombstone_msg(blob_id, session_id)
                     or f"Error: blob {blob_id} not found (may have been swept)")
+        # T1.4: integrity verification. Full SHA256 over the on-disk bytes
+        # compared with the index-recorded hash. A mismatch returns an
+        # exact deterministic marker and logs at WARNING. The verification
+        # is gated by config (default on) so benchmarks can opt out
+        # without touching the rescue/fetch contract. The ``raw`` bytes
+        # are only decoded AFTER verification so a corrupted blob is
+        # never surfaced to the model as data.
+        if self.cfg.get("verify_integrity", True):
+            meta = self._find_meta(blob_id, session_id)
+            expected = meta.get("hash") if meta else None
+            if expected:
+                actual = hashlib.sha256(raw).hexdigest()
+                if actual != expected:
+                    logger.warning(
+                        "toolaria: integrity check failed for blob %s "
+                        "(expected %s…, got %s…)",
+                        blob_id, expected[:8], actual[:8],
+                    )
+                    return (
+                        f"{INTEGRITY_FAIL_MARKER_PREFIX}{blob_id}"
+                        f"{INTEGRITY_FAIL_MARKER_SUFFIX}"
+                    )
 
         try:
             text = raw.decode("utf-8")

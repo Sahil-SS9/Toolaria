@@ -408,3 +408,89 @@ class TestArgsProvenance:
         assert entry["args_snapshot"] is None, (
             "max_chars=0 must be a benchmark-only escape hatch (no capture)"
         )
+
+
+# ═══ T1.4 — full SHA256 integrity verify on fetch ════════════════════════
+
+
+import logging as _logging  # noqa: E402  (local to T1.4 cluster)
+
+
+class TestIntegrityVerify:
+    """T1.4: deterministic marker on hash mismatch; default on."""
+
+    def test_valid_blob_passes_verify(self, plugin, toolaria):
+        bid = toolaria._store.put("clean content", "web_search",
+                                   session_id="s1")
+        r = toolaria._fetch(args={"id": bid, "mode": "full"}, session_id="s1")
+        assert r == "clean content"
+        assert "integrity" not in r.lower()
+
+    def test_corrupted_blob_returns_exact_marker(self, plugin, toolaria):
+        bid = toolaria._store.put("clean content", "web_search",
+                                   session_id="s1")
+        # Corrupt the blob bytes; the index entry's hash is still the
+        # original, so verify must fail.
+        (toolaria._store.blob_dir / bid).write_bytes(b"corrupted!")
+        r = toolaria._fetch(args={"id": bid, "mode": "full"}, session_id="s1")
+        from blobstore import (INTEGRITY_FAIL_MARKER_PREFIX,
+                                INTEGRITY_FAIL_MARKER_SUFFIX)
+        expected = f"{INTEGRITY_FAIL_MARKER_PREFIX}{bid}{INTEGRITY_FAIL_MARKER_SUFFIX}"
+        assert r == expected, f"expected exact marker, got {r!r}"
+
+    def test_corruption_logged(self, plugin, toolaria, caplog):
+        bid = toolaria._store.put("clean", "web_search", session_id="s1")
+        (toolaria._store.blob_dir / bid).write_bytes(b"corrupt")
+        with caplog.at_level(_logging.WARNING, logger="blobstore"):
+            toolaria._fetch(args={"id": bid, "mode": "full"}, session_id="s1")
+        assert any("integrity" in r.getMessage().lower() for r in caplog.records), (
+            "integrity failure must be logged at WARNING"
+        )
+
+    def test_verify_disabled_skips_check(self, plugin, toolaria):
+        """verify_integrity=false is a documented benchmark-only escape."""
+        toolaria._store.cfg["verify_integrity"] = False
+        bid = toolaria._store.put("clean", "web_search", session_id="s1")
+        (toolaria._store.blob_dir / bid).write_bytes(b"corrupt")
+        r = toolaria._fetch(args={"id": bid, "mode": "full"}, session_id="s1")
+        assert r == "corrupt", (
+            "with verify disabled, the corrupted bytes are returned; this is "
+            "the documented benchmark-only behaviour"
+        )
+
+    def test_default_verify_is_on(self, toolaria, base_cfg, fake_ctx_cls):
+        """A fresh cfg must default to verify_integrity=true."""
+        cfg = dict(base_cfg)
+        cfg.pop("verify_integrity", None)
+        fc = fake_ctx_cls({"toolaria": cfg})
+        toolaria.register(fc)
+        assert toolaria._store.cfg.get("verify_integrity", True) is True
+
+    def test_other_modes_also_verify(self, plugin, toolaria):
+        """Integrity is enforced for every mode that reads bytes."""
+        from blobstore import INTEGRITY_FAIL_MARKER_PREFIX
+        bid = toolaria._store.put("hello\nworld", "web_search", session_id="s1")
+        (toolaria._store.blob_dir / bid).write_bytes(b"corrupted")
+        for mode in ("range", "grep", "full", "outline"):
+            r = toolaria._fetch(args={"id": bid, "mode": mode}, session_id="s1")
+            assert r.startswith(INTEGRITY_FAIL_MARKER_PREFIX), (
+                f"mode {mode} did not return the integrity marker: {r!r}"
+            )
+
+    def test_perf_guard_multi_mb(self, plugin, toolaria):
+        """Multi-MB blobs must verify within a generous bound (sleep tolerance).
+
+        Uses range mode (full mode refuses over full_fetch_max_chars=50000 by
+        default, regardless of the verify path). The point is to confirm
+        the SHA256 over a multi-MB blob fits the perf guard, not to time the
+        full-mode read path."""
+        big = "x" * (3 * 1024 * 1024)  # 3 MB
+        bid = toolaria._store.put(big, "web_extract", session_id="s1")
+        t0 = time.time()
+        r = toolaria._fetch(args={"id": bid, "mode": "range", "start": 0,
+                                   "count": 1}, session_id="s1")
+        elapsed = time.time() - t0
+        # Generous bound — slow CI runners, TSan, etc. The point is to
+        # catch quadratic regressions, not microbenchmark.
+        assert "lines 0..0" in r, f"unexpected range output: {r[:200]!r}"
+        assert elapsed < 3.0, f"verify+range on 3MB took {elapsed:.2f}s (bound 3s)"
