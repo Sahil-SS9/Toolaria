@@ -46,11 +46,21 @@ _RESCUABLE_TOOLS: set[str] = {
 
 # Single source of truth for tools that must never be intercepted.
 # Enforced unconditionally in _on_transform, so _is_rescuable failing open
-# (registry import broken) still cannot touch these.
+# (registry import broken) still cannot touch these. Hardened in Phase 0
+# (T0.2): shell/exec-class and file-write-class tools are added so a broken
+# registry cannot rescue token-bearing shell output or the contents of a
+# file about to be edited.
 _UNCONDITIONAL_EXCLUDES: frozenset[str] = frozenset({
     "rescuer_fetch", "delegate_task", "session_search",
     "cronjob", "skill_view", "skill_manage", "skill_request",
     "kanban_create", "open_kanban", "clarify", "memory",
+    # Shell / exec-class sinks — token-bearing output must never hit the store.
+    "shell", "bash", "exec", "terminal", "subprocess",
+    "run_command", "run_shell",
+    # File-write-class sinks — file contents about to be written must not be
+    # rescued, both because they may contain secrets and because rescuing
+    # them adds no value (the model just wrote them).
+    "write_file", "file_write", "fs_write", "edit_file",
 })
 
 

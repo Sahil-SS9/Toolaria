@@ -145,3 +145,92 @@ def test_migration_chmod_failure_does_not_crash_init(
     assert any("chmod" in r.getMessage().lower() for r in caplog.records), (
         f"expected a chmod warning, got: {[r.getMessage() for r in caplog.records]}"
     )
+
+
+# ═══ T0.2 — Shell/write-class tools never rescued even under registry failure ═══
+
+
+SHELL_WRITE_CLASS_TOOLS = [
+    "shell", "bash", "exec", "terminal", "subprocess",
+    "run_command", "run_shell",
+    "write_file", "file_write", "fs_write", "edit_file",
+]
+
+
+@pytest.fixture
+def fail_open_registry(monkeypatch):
+    """Simulate a broken `tools.registry` import so _is_rescuable returns
+    True for anything not in its built-in set or the unconditional excludes.
+
+    The fail-open path is the very safety hole T0.2 closes: shell/exec and
+    file-write results must still pass through untouched."""
+    # Force the import to raise by stashing an unimportable module.
+    import sys
+    import types
+
+    class _Broken(types.ModuleType):
+        def __getattr__(self, name):
+            raise ImportError("simulated registry breakage")
+
+    monkeypatch.setitem(sys.modules, "tools.registry", _Broken("tools.registry"))
+
+
+def test_shell_class_tools_not_rescued_under_broken_registry(
+    toolaria, plugin, fail_open_registry
+):
+    """With the registry broken, shell/exec-class tools must still pass
+    through unrescued (return None) so a token-bearing shell output never
+    reaches the blob store."""
+    big = "rm -rf " + "payload " * 1000
+    for tool in ("shell", "run_shell", "bash", "exec",
+                 "run_command", "terminal", "subprocess"):
+        r = toolaria._on_transform(tool_name=tool, result=big)
+        assert r is None, f"{tool} must NOT be rescued under registry failure"
+
+
+def test_write_class_tools_not_rescued_under_broken_registry(
+    toolaria, plugin, fail_open_registry
+):
+    """Same guarantee for write-class tools: token-bearing output (e.g.
+    the contents of a file about to be edited) must never hit the store."""
+    big = "secret " + "x " * 2000
+    for tool in ("write_file", "file_write", "fs_write", "edit_file"):
+        r = toolaria._on_transform(tool_name=tool, result=big)
+        assert r is None, f"{tool} must NOT be rescued under registry failure"
+
+
+def test_normal_tools_still_rescued_under_broken_registry(
+    toolaria, plugin, fail_open_registry
+):
+    """Fail-open (True on registry failure) must STILL rescue normal tools;
+    T0.2 only tightens the unconditional excludes, not the fail-open
+    default for unknown tools."""
+    big = "a " * 5000  # ~10K chars, well over base_cfg max_result_chars (8000)
+    r = toolaria._on_transform(tool_name="some_mcp_tool", result=big)
+    assert r is not None, "fail-open must still rescue unknown tools"
+    assert "rescued" in r
+
+
+def test_unconditional_excludes_contain_shell_and_write_classes(
+    toolaria, plugin
+):
+    """The hardening is in the shipped frozenset, not in a per-call branch:
+    audit the constants so a future edit that drops a class fails the test
+    rather than silently reopening the fail-open safety hole."""
+    excl = toolaria._UNCONDITIONAL_EXCLUDES
+    for t in SHELL_WRITE_CLASS_TOOLS:
+        assert t in excl, (
+            f"{t} missing from _UNCONDITIONAL_EXCLUDES; registry failure "
+            f"would rescue shell/write results into the blob store"
+        )
+
+
+def test_excluded_shell_tool_not_rescued_even_when_in_allowlist(
+    toolaria, plugin
+):
+    """Config-level allowlists cannot override the unconditional excludes:
+    a user adding 'shell' to exclude_tools or a permissive rescue path
+    must not be able to bring shell back into the rescue catchment."""
+    big = "data " * 1500
+    # Even with a forced rescue path, shell must not be rescued.
+    assert toolaria._on_transform(tool_name="shell", result=big) is None
