@@ -557,6 +557,215 @@ class BlobStore:
             raise _EncryptionUnavailable(
                 f"Fernet decrypt failed for {blob_id}: {exc}") from exc
 
+    # ── T4.3 key rotation ────────────────────────────────────────────────
+
+    def rotate_key(self, new_key_path: str) -> int:
+        """Re-encrypt every encrypted credential blob under a new
+        Fernet key in one pass. Returns the number of blobs
+        re-encrypted.
+
+        Algorithm (abort-safe):
+
+          1. Resolve the OLD Fernet from the CURRENT key file. If
+             the current key file is missing or invalid the rotation
+             aborts before touching any blob — the store stays on
+             whatever it had.
+          2. Load or generate the NEW key at *new_key_path* (writes
+             0600 if generating). The OLD key file is NOT touched.
+          3. Walk every on-disk blob whose entry carries ``enc: True``
+             and atomic-rewrite it under the new key. Per-blob
+             failures collect the bid; the partial state is rolled
+             back by re-encrypting each already-rotated blob under
+             the OLD key so the store keeps serving under the old
+             key until the operator retries.
+          4. On full success: update ``cfg["toolaria_key_file"]`` to
+             point at the new path, drop the cached Fernet so reads
+             pick up the new key, write ONE ``key_rotated`` ledger
+             row with the count.
+          5. On any per-blob failure during the pass: re-encrypt
+             every already-rotated blob back under the OLD key,
+             restore ``cfg["toolaria_key_file"]`` to the OLD path,
+             and re-raise the original exception. NO ledger row is
+             emitted for a failed pass.
+
+        The OLD key file (when ``new_key_path != old_path``) is
+        retained after a successful rotation — losing it makes the
+        pre-rotation ciphertexts unreadable, so the operator may
+        want to keep it until they confirm the new-key decrypts
+        everything.
+        """
+        if not _HAVE_FERNET:
+            raise _EncryptionUnavailable(
+                "cryptography.fernet unavailable; cannot rotate key")
+        # 1. Resolve old key.
+        old_path = self.cfg.get("toolaria_key_file")
+        if not old_path:
+            raise _EncryptionUnavailable(
+                "no toolaria_key_file configured; nothing to rotate")
+        old_path_p = Path(old_path).expanduser()
+        try:
+            old_key_bytes = old_path_p.read_bytes().strip()
+            old_fernet = _Fernet(old_key_bytes)
+        except (OSError, ValueError, Exception) as exc:
+            raise _EncryptionUnavailable(
+                f"old key file {old_path_p} unreadable or invalid: {exc}"
+            ) from exc
+
+        # 2. Resolve new key (load if exists, generate if missing).
+        new_path_p = Path(new_key_path).expanduser()
+        try:
+            new_path_p.parent.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            raise _EncryptionUnavailable(
+                f"could not create new key file dir {new_path_p.parent}: "
+                f"{exc}") from exc
+        new_key_bytes: bytes
+        generated = False
+        if new_path_p.exists():
+            try:
+                new_key_bytes = new_path_p.read_bytes().strip()
+                _Fernet(new_key_bytes)  # validate
+            except (OSError, ValueError, Exception) as exc:
+                raise _EncryptionUnavailable(
+                    f"new key file {new_path_p} unreadable or invalid: "
+                    f"{exc}") from exc
+        else:
+            new_key_bytes = _Fernet.generate_key()
+            generated = True
+        new_fernet = _Fernet(new_key_bytes)
+
+        # 3. Walk every encrypted blob and re-encrypt.
+        rotated: list[str] = []
+        encrypted_bids = self._collect_encrypted_bids()
+        last_exc: Exception | None = None
+        try:
+            for bid in encrypted_bids:
+                bpath = self.blob_dir / bid
+                try:
+                    cipher_old = bpath.read_bytes()
+                    plain = old_fernet.decrypt(cipher_old)
+                    cipher_new = new_fernet.encrypt(plain)
+                    self._atomic_write_blob(bpath, cipher_new)
+                    rotated.append(bid)
+                except Exception as exc:
+                    last_exc = exc
+                    raise
+        except Exception:
+            # 4. Abort-safety: roll back the already-rotated blobs.
+            logger.warning(
+                "toolaria: T4.3 rotation failed mid-pass (%s); rolling "
+                "back %d already-rotated blob(s) under the old key",
+                last_exc, len(rotated),
+            )
+            for bid in rotated:
+                bpath = self.blob_dir / bid
+                try:
+                    cipher_new = bpath.read_bytes()
+                    plain = new_fernet.decrypt(cipher_new)
+                    cipher_old = old_fernet.encrypt(plain)
+                    self._atomic_write_blob(bpath, cipher_old)
+                except Exception as rb_exc:
+                    # A rollback failure is logged loudly; the caller
+                    # already gets the original exception. The store
+                    # may now be inconsistent (some blobs under the
+                    # new key, some under the old); the operator must
+                    # intervene.
+                    logger.error(
+                        "toolaria: T4.3 rollback FAILED for %s: %s; "
+                        "store may be in an inconsistent state — restore "
+                        "from backup or re-run rotation",
+                        bid, rb_exc,
+                    )
+            # If we generated the new key file but the rotation failed,
+            # remove it so a future retry doesn't see a half-rotated
+            # new key (it'd be a valid key but unused).
+            if generated:
+                try:
+                    new_path_p.unlink()
+                except OSError:
+                    pass
+            raise
+
+        # 5. Successful pass: if we generated a new key file, leave
+        # it (the operator points the store at it via cfg below).
+        # If new_path == old_path the new key has overwritten the old
+        # on disk already — both are byte-identical bytes because
+        # we wrote ``new_key_bytes`` to ``new_path_p``... wait, we
+        # never wrote new_key_bytes; we only used it in-memory.
+        # Fix: write the new key to its path so a restart picks it up.
+        if generated or (new_path_p != old_path_p and
+                          new_path_p.read_bytes().strip() != new_key_bytes):
+            try:
+                tmp = new_path_p.with_suffix(new_path_p.suffix + ".tmp")
+                tmp.write_bytes(new_key_bytes)
+                os.replace(tmp, new_path_p)
+                _chmod_safe(new_path_p, _FILE_MODE)
+            except OSError as exc:
+                logger.warning(
+                    "toolaria: T4.3 could not persist new key to %s: %s; "
+                    "in-memory rotation succeeded but a restart will lose "
+                    "the new key", new_path_p, exc,
+                )
+
+        # Switch cfg + cache.
+        self.cfg["toolaria_key_file"] = str(new_path_p)
+        self._fernet = new_fernet
+
+        # 6. Ledger row.
+        try:
+            from ledger import log_key_rotation
+            log_key_rotation(
+                self.cfg, count=len(rotated),
+                old_key_file=str(old_path_p),
+                new_key_file=str(new_path_p),
+            )
+        except Exception as exc:
+            logger.warning(
+                "toolaria: could not write key_rotation ledger row: %s",
+                exc,
+            )
+
+        return len(rotated)
+
+    def _collect_encrypted_bids(self) -> list[str]:
+        """Return a sorted list of bid strings whose index entry
+        carries ``enc: True``.
+
+        Walks every session index so cross-session encrypted blobs
+        are caught even when only one session was used during the
+        rotation window.
+        """
+        bids: set[str] = set()
+        for ip in sorted(self.meta_dir.glob("*.json")):
+            idx = self._read_idx_file(ip)
+            for bid, entry in (idx.get("blobs") or {}).items():
+                if isinstance(entry, dict) and entry.get("enc") is True:
+                    bids.add(bid)
+        return sorted(bids)
+
+    @staticmethod
+    def _atomic_write_blob(bpath, data: bytes) -> None:
+        """Atomic replace of a blob file with *data* at 0600.
+
+        Used by the rotation pass so a concurrent reader never sees
+        partial ciphertext mid-rewrite.
+        """
+        import tempfile
+        fd, tmp = tempfile.mkstemp(dir=bpath.parent,
+                                    prefix=f"{bpath.name}.tmp.",
+                                    suffix=".blob")
+        try:
+            with os.fdopen(fd, "wb") as f:
+                f.write(data)
+            os.chmod(tmp, _FILE_MODE)
+            os.replace(tmp, bpath)
+        except Exception:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+
     # ── sidecars (per-blob index/vector artefacts) ──
 
     def sidecar_path(self, blob_id: str, suffix: str) -> Path | None:

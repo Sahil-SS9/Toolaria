@@ -162,3 +162,34 @@ def log_expansion(cfg: dict, *, sid: str, blob_id: str, dst_tool: str,
         )
         return True
     return False
+
+
+def log_key_rotation(cfg: dict, *, count: int,
+                     old_key_file: str, new_key_file: str) -> bool:
+    """T4.3: write one key-rotation ledger row per successful pass.
+
+    The row carries the count of blobs that were re-encrypted, plus
+    the source/destination key file paths so an operator can audit
+    which key was active at which moment. Lives in
+    ``ledger/key_rotations.jsonl`` so it is discoverable alongside the
+    expansion and entity-binding ledgers.
+
+    Best-effort, never raises — a failed audit append must not break
+    the rotation itself, which has already mutated on-disk bytes by
+    this point.
+    """
+    record = {
+        "ts": time.time(),
+        "decision": "key_rotated",
+        "count": int(count),
+        "old_key_file": old_key_file,
+        "new_key_file": new_key_file,
+    }
+    path = ledger_path(cfg, "key_rotations")
+    if append_line(path, record):
+        logger.info(
+            "toolaria: key rotation complete; %d blob(s) re-encrypted "
+            "under %s (was %s)", count, new_key_file, old_key_file,
+        )
+        return True
+    return False
