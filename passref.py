@@ -29,8 +29,10 @@ import re
 
 try:
     from .ledger import log_expansion as _log_expansion
+    from .ledger import log_entity_binding
 except ImportError:
     from ledger import log_expansion as _log_expansion  # type: ignore[no-redef]
+    from ledger import log_entity_binding  # type: ignore[no-redef]
 
 logger = logging.getLogger(__name__)
 
@@ -356,6 +358,93 @@ def _expand_string(text: str, store, cfg: dict, stats: dict,
     return TOKEN_RE.sub(_sub, text), denied
 
 
+def _confirmation_required(cfg: dict) -> bool:
+    """T3.3: ambiguity confirmation gate active iff explicitly enabled.
+
+    Truthy semantics (not bare bool()) so a YAML-quoted ``"false"``
+    actually disables the gate — same posture as
+    ``_credential_enforcement_active``.
+    """
+    from blobstore import BlobStore
+    return BlobStore._truthy(cfg.get("confirmation_required", False))
+
+
+# Confirmation marker template: ``"<prefix> N entity kinds (<kinds>); <suffix>"``.
+# Exported so tests can pin against the exact shape and value_flow_audit
+# can group rows by the same string.
+ENTITY_CONFIRMATION_MARKER_PREFIX = (
+    "[Toolaria: action spans "
+)
+ENTITY_CONFIRMATION_MARKER_KINDS = " entity kinds ("
+ENTITY_CONFIRMATION_MARKER_SEP = ", "
+ENTITY_CONFIRMATION_MARKER_MIDDLE = "); confirm target or widen entity_registry]"
+ENTITY_CONFIRMATION_MARKER = (
+    ENTITY_CONFIRMATION_MARKER_PREFIX + "{n}" + ENTITY_CONFIRMATION_MARKER_KINDS
+    + "{kinds}" + ENTITY_CONFIRMATION_MARKER_MIDDLE
+)
+
+
+def _confirmation_marker(kinds: list[str]) -> str:
+    """T3.3: build the deterministic confirmation marker for ``kinds``.
+
+    ``kinds`` is the sorted distinct kind list. Output is exact and
+    stable — the audit script can match on the literal prefix and the
+    ``<kinds>`` substring to attribute ambiguous-gated requests.
+    """
+    return ENTITY_CONFIRMATION_MARKER.format(
+        n=len(kinds), kinds=ENTITY_CONFIRMATION_MARKER_SEP.join(kinds))
+
+
+def _blob_ids_in_args(args) -> list[str]:
+    """Return the order-stable de-duplicated list of tla:<id> blob ids
+    found in nested args.
+
+    Recurses over dict/list/str so the same shape the rest of the
+    middleware uses for token expansion is covered.
+    """
+    found: list[str] = []
+    seen: set[str] = set()
+
+    def _walk(v) -> None:
+        if isinstance(v, str):
+            for bid in TOKEN_RE.findall(v):
+                if bid not in seen:
+                    seen.add(bid)
+                    found.append(bid)
+        elif isinstance(v, dict):
+            for vv in v.values():
+                _walk(vv)
+        elif isinstance(v, (list, tuple)):
+            for vv in v:
+                _walk(vv)
+
+    _walk(args)
+    return found
+
+
+def _replace_tokens_with_marker(args, marker: str):
+    """Return a copy of *args* with every ``tla:<id>`` token replaced
+    by *marker*. The shape is preserved (dict/list/str); non-tla
+    values pass through unchanged.
+
+    The replacement string is treated literally (``re.sub`` does not
+    see backslashes in marker text), so the marker can contain ``\\``
+    or ``\\g<...>`` safely.
+    """
+    def _walk(v):
+        if isinstance(v, str):
+            return TOKEN_RE.sub(marker, v)
+        if isinstance(v, dict):
+            return {k: _walk(vv) for k, vv in v.items()}
+        if isinstance(v, list):
+            return [_walk(vv) for vv in v]
+        if isinstance(v, tuple):
+            return tuple(_walk(vv) for vv in v)
+        return v
+
+    return _walk(args)
+
+
 def make_middleware(get_store, cfg: dict, skip_tools: frozenset):
     """Build a tool_request middleware callback bound to a store accessor."""
 
@@ -371,6 +460,53 @@ def make_middleware(get_store, cfg: dict, skip_tools: frozenset):
         if store is None:
             return None
         session_id = kwargs.get("session_id", "")
+        # T3.1 / T3.2 / T3.3: entity-binding governor. Default-empty
+        # ``entity_registry`` short-circuits the whole block so the
+        # path is byte-identical to pre-T3 when the operator has not
+        # opted in. The block sits BEFORE expansion so binding rows are
+        # recorded in the ledger with the pre-expansion context.
+        from entities import get_registry, extract_entities, distinct_entity_kinds
+        try:
+            _entity_reg = get_registry(cfg)
+        except Exception as exc:
+            # A broken entity_registry would have failed at register
+            # time (T3.1 / FIX-4). Reaching here means a config was
+            # mutated at runtime; log and stay inert so the rescue
+            # path never crashes.
+            logger.warning(
+                "toolaria: entity_registry resolve failed at request "
+                "time: %s; skipping binding scan", exc,
+            )
+            _entity_reg = []
+        if _entity_reg:
+            matches = extract_entities(args, _entity_reg)
+            kinds = distinct_entity_kinds(matches)
+            blob_ids = _blob_ids_in_args(args)
+            # T3.2: observe-only binding rows, one per (tool, kind,
+            # blob_id) combination. Logged even when the destination
+            # is later denied — the binding captures the action,
+            # not its allow status.
+            if matches and blob_ids:
+                for bid in blob_ids:
+                    for kind in kinds:
+                        log_entity_binding(
+                            cfg, sid=session_id, tool=tool_name,
+                            entity_kind=kind, blob_id=bid,
+                            decision="entity_bound",
+                        )
+            # T3.3: ambiguity confirmation gate. Only fires when (a)
+            # there is at least one token to expand AND (b) the args
+            # span multiple distinct kinds. With confirmation_required
+            # OFF (default) the gate is dormant and expansion proceeds
+            # unchanged.
+            if (blob_ids and len(kinds) > 1
+                    and _confirmation_required(cfg)):
+                marker = _confirmation_marker(kinds)
+                log_entity_binding(
+                    cfg, sid=session_id, tool=tool_name,
+                    entity_kinds=kinds, decision="ambiguous_gated",
+                )
+                return {"args": _replace_tokens_with_marker(args, marker)}
         stats: dict = {}
         # We expand unconditionally here even when the tool is not allowed:
         # the destination-deny path needs to produce a marker (modified

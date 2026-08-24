@@ -63,6 +63,44 @@ def append_line(path, record: dict) -> bool:
         return False
 
 
+def log_entity_binding(cfg: dict, *, sid: str, tool: str,
+                       decision: str, entity_kind: str | None = None,
+                       entity_kinds: list[str] | None = None,
+                       blob_id: str | None = None) -> bool:
+    """Write one T3.2 action→entity binding record (observe-only).
+
+    ``decision`` ∈ ``entity_bound`` (T3.2: a registered entity was
+    mentioned alongside a tla:<id> blob reference) | ``ambiguous_gated``
+    (T3.3: the ambiguity gate fired for this request).
+
+    Either ``entity_kind`` (single, for ``entity_bound``) or
+    ``entity_kinds`` (sorted list, for ``ambiguous_gated``) is set;
+    unused fields are omitted so JSONL diffs stay minimal. A write
+    failure is logged at WARNING and returns False — the passref path
+    must never raise into expansion.
+    """
+    record: dict = {
+        "ts": time.time(),
+        "sid": sid,
+        "tool": tool,
+        "decision": decision,
+    }
+    if entity_kind is not None:
+        record["entity_kind"] = entity_kind
+    if entity_kinds:
+        record["entity_kinds"] = sorted(entity_kinds)
+    if blob_id is not None:
+        record["blob_id"] = blob_id
+    path = ledger_path(cfg, "entity_bindings")
+    if append_line(path, record):
+        logger.info(
+            "toolaria: entity binding tool=%s decision=%s kind=%s",
+            tool, decision, entity_kind,
+        )
+        return True
+    return False
+
+
 def log_expansion(cfg: dict, *, sid: str, blob_id: str, dst_tool: str,
                   chars: int, decision: str,
                   label: str | None = None) -> bool:
