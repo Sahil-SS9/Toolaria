@@ -158,8 +158,8 @@ def _merge_cfg(user_cfg: dict) -> dict:
     # raises ValueError listing offending keys/values; we let that
     # bubble up to register() and abort plugin load so the operator
     # sees the typo before any rescue runs.
-    from labels import _parse_tool_label_map as _parse_labels
-    _parse_labels(defaults.get("sensitivity_tool_labels"))
+    from labels import _parse_tool_label_map
+    _parse_tool_label_map(defaults.get("sensitivity_tool_labels"))
     return defaults
 
 

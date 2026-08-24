@@ -37,6 +37,13 @@ except ImportError:
 _LABEL_SENSITIVITY = {"public": 0, "internal": 1, "personal": 2,
                        "credential": 3}
 _SLICE_MASK_MARKER = "[masked:credential-shape]"
+# Over-fetch headroom for masked grep/chain: raw output is gathered at 4x
+# cap so post-mask re-capping still fills the budget. (Correctness agent:
+# named once — the two call sites must not drift.)
+_MASK_OVERFETCH_FACTOR = 4
+# Scan window when testing a line against credential-shape patterns.
+# (Clarity agent: was hardcoded [:2000] in three places; one constant.)
+_MASK_LINE_SCAN_LEN = 2000
 _SLICE_BUDGET_MARKER_PREFIX = (
     "[Toolaria: credential slice budget exhausted for "
 )
@@ -429,7 +436,6 @@ class BlobStore:
                 tool_label = label_for_tool(tool_name, self.cfg)
                 resolved = (_label_for_args(args, label, self.cfg)
                             if label != "credential" else label)
-                _ = tool_label  # used implicitly via label_for_args above
         except Exception as exc:
             logger.warning(
                 "toolaria: label resolution failed for %s (tool=%s): %s; "
@@ -477,7 +483,8 @@ class BlobStore:
                 "label": final_label,
             }
             # FIX-2: credential-slice cumulative-chars counter (resets on
-            # sweep). Seed on first put so the budget lookup is O(1).
+            # sweep). Seed only to make the field visible to audit
+            # tooling; _charge_slice_budget's .get default handles absence.
             if final_label == "credential":
                 idx["blobs"][bid].setdefault("credential_served_chars", 0)
             self._save_idx(idx, sid)
@@ -902,7 +909,8 @@ class BlobStore:
         pattern with the structural mask marker; preserve line count."""
         out = []
         for ln in lines:
-            text = ln[:2000] if isinstance(ln, str) else ""
+            text = (ln[:_MASK_LINE_SCAN_LEN]
+                    if isinstance(ln, str) else "")
             if any(p.search(text) for p in _LABEL_UPGRADE_PATTERNS):
                 out.append(_SLICE_MASK_MARKER)
             else:
@@ -919,12 +927,14 @@ class BlobStore:
             return self._grep_safe(lines, pattern, cap), 0
         # Run grep with a generous cap so we can post-filter without
         # losing line numbers; we'll re-cap after masking.
-        raw = self._grep_safe(lines, pattern, cap * 4)
+        raw = self._grep_safe(lines, pattern,
+                              cap * _MASK_OVERFETCH_FACTOR)
         out_lines: list = []
         for ln in raw.splitlines():
             if ": " in ln and ln.split(": ", 1)[0].isdigit():
                 n, body = ln.split(": ", 1)
-                if any(p.search(body[:2000]) for p in _LABEL_UPGRADE_PATTERNS):
+                if any(p.search(body[:_MASK_LINE_SCAN_LEN])
+                       for p in _LABEL_UPGRADE_PATTERNS):
                     out_lines.append(f"{n}: {_SLICE_MASK_MARKER}")
                     continue
             out_lines.append(ln)
@@ -937,10 +947,12 @@ class BlobStore:
         """Chain helper with the same FIX-2 masking contract as grep."""
         if not mask_lines:
             return self._chain(lines, pattern, count, cap), 0
-        raw = self._chain(lines, pattern, count, cap * 4)
+        raw = self._chain(lines, pattern, count,
+                          cap * _MASK_OVERFETCH_FACTOR)
         out_lines: list = []
         for ln in raw.splitlines():
-            if any(p.search(ln[:2000]) for p in _LABEL_UPGRADE_PATTERNS):
+            if any(p.search(ln[:_MASK_LINE_SCAN_LEN])
+                   for p in _LABEL_UPGRADE_PATTERNS):
                 out_lines.append(_SLICE_MASK_MARKER)
             else:
                 out_lines.append(ln)

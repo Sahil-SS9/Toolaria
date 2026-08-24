@@ -152,16 +152,14 @@ def _credential_destinations_allow(cfg: dict) -> frozenset:
 
 
 def _credential_enforcement_active(cfg: dict) -> bool:
-    """Phase 3 MEDIUM: explicit truthy semantics.
+    """True iff credential-grade enforcement is enabled.
 
-    Note: this function only checks ``enforcement_enabled`` — it does
-    NOT check the allowlist. An empty allowlist + enforcement on is a
-    deny-all (every credential expansion refused), which is the safe
-    default. ``_credential_destinations_allow`` is the per-destination
-    check.
-
-    Phase 3 MEDIUM: explicit truthy semantics (not bare bool()) so a
-    YAML-quoted ``"false"`` actually disables the gate."""
+    Explicit truthy semantics (not bare bool()) so a YAML-quoted
+    ``"false"`` actually disables the gate. This function only checks
+    ``enforcement_enabled`` — it does NOT check the allowlist: an empty
+    allowlist + enforcement on is a deny-all (every credential
+    expansion refused), which is the safe default.
+    ``_credential_destinations_allow`` is the per-destination check."""
     from blobstore import BlobStore
     return BlobStore._truthy(cfg.get("enforcement_enabled", False))
 
