@@ -1501,28 +1501,41 @@ class BlobStore:
                     f"{count!r}).")
         n = min(n, 1000)
         ledger = self.meta_dir.parent / "ledger" / "expansions.jsonl"
-        if not ledger.exists():
+        rows: list[dict] = []
+        if ledger.exists():
+            try:
+                with open(ledger, "r", encoding="utf-8") as fh:
+                    # Stream the tail so memory stays bounded by ``n``,
+                    # not by the lifetime of the ledger.
+                    from collections import deque
+                    tail: "deque[dict]" = deque(maxlen=n)
+                    for line in fh:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            tail.append(json.loads(line))
+                        except json.JSONDecodeError:
+                            continue  # skip malformed lines, keep summarising
+                    rows = list(tail)
+            except OSError:
+                return "Toolaria audit: ledger unreadable (I/O error)."
+        if not rows and not ledger.exists():
+            # T3.4: before returning the friendly "no data" line, give
+            # the entity-binding section a chance to surface — a fresh
+            # install may have entity_bindings.jsonl rows (T3.2) without
+            # any expansion ledger activity yet. The "no data" wording
+            # would be misleading in that case.
+            eb_only = self._audit_entity_summary(n)
+            if eb_only:
+                return (f"Toolaria audit (no expansion ledger yet):\n"
+                        f"{eb_only}")
             return ("Toolaria audit: no data yet "
                     "(no expansions recorded; ledger file not present).")
-        rows: list[dict] = []
-        try:
-            with open(ledger, "r", encoding="utf-8") as fh:
-                # Stream the tail so memory stays bounded by ``n``,
-                # not by the lifetime of the ledger.
-                from collections import deque
-                tail: "deque[dict]" = deque(maxlen=n)
-                for line in fh:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        tail.append(json.loads(line))
-                    except json.JSONDecodeError:
-                        continue  # skip malformed lines, keep summarising
-                rows = list(tail)
-        except OSError:
-            return "Toolaria audit: ledger unreadable (I/O error)."
         if not rows:
+            eb_only = self._audit_entity_summary(n)
+            if eb_only:
+                return f"Toolaria audit (last 0 events):\n{eb_only}"
             return "Toolaria audit: ledger present but empty."
         by_dst: dict[str, dict] = {}
         for row in rows:
@@ -1540,7 +1553,75 @@ class BlobStore:
             lines.append(
                 f"  {dst}: expanded={slot['expanded']} "
                 f"denied={slot['denied']} chars={slot['chars']:,}")
+        # T3.4: entity-binding summary (per-kind + top ambiguous tools).
+        # The block is appended when entity_bindings.jsonl has rows;
+        # a missing or empty ledger leaves the existing summary
+        # byte-identical so pre-T3 callers see no change.
+        eb_section = self._audit_entity_summary(n)
+        if eb_section:
+            lines.append(eb_section)
         return "\n".join(lines)
+
+    def _audit_entity_summary(self, n: int) -> str:
+        """T3.4: read the tail of entity_bindings.jsonl and return the
+        rendered summary block, or ``""`` if the ledger is empty.
+
+        Bounded by ``n`` (the same count passed to ``_audit_summary``)
+        so the in-memory tail is at most ``n`` rows — the function
+        adds no new I/O budget on top of the existing audit call.
+        """
+        from collections import deque
+        eb_path = self.meta_dir.parent / "ledger" / "entity_bindings.jsonl"
+        if not eb_path.exists():
+            return ""
+        rows: list[dict] = []
+        try:
+            with open(eb_path, "r", encoding="utf-8") as fh:
+                tail: "deque[dict]" = deque(maxlen=n)
+                for line in fh:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        tail.append(json.loads(line))
+                    except json.JSONDecodeError:
+                        continue
+                rows = list(tail)
+        except OSError:
+            return ""
+        if not rows:
+            return ""
+        per_kind: dict[str, int] = {}
+        ambig_by_tool: dict[str, int] = {}
+        ambig_total = 0
+        bound_total = 0
+        for r in rows:
+            decision = r.get("decision", "")
+            if decision == "entity_bound":
+                bound_total += 1
+                k = r.get("entity_kind")
+                if k:
+                    per_kind[k] = per_kind.get(k, 0) + 1
+            elif decision == "ambiguous_gated":
+                ambig_total += 1
+                t = r.get("tool") or "(unknown)"
+                ambig_by_tool[t] = ambig_by_tool.get(t, 0) + 1
+        if not bound_total and not ambig_total:
+            return ""
+        out = ["  entity bindings (T3.4):"]
+        if bound_total:
+            kind_parts = [f"{k}={v}" for k, v in sorted(per_kind.items())]
+            out.append(
+                f"    bound total: {bound_total}  "
+                + (", ".join(kind_parts) if kind_parts else "(no kinds)")
+            )
+        if ambig_total:
+            out.append(f"    ambiguous_gated total: {ambig_total}")
+            for tool, count in sorted(
+                    ambig_by_tool.items(),
+                    key=lambda kv: (-kv[1], kv[0])):
+                out.append(f"      top ambiguous: {tool} ({count})")
+        return "\n".join(out)
 
 
     def _sweep_by_ttl(self, now, ttl, tomb_ttl):

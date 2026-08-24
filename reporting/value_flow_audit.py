@@ -62,6 +62,65 @@ def load_ledger(store_path) -> list[dict]:
     return out
 
 
+# ── T3.4: entity bindings ─────────────────────────────────────────────────
+
+
+def load_entity_bindings(store_path) -> list[dict]:
+    """Yield events from the T3.2 entity_bindings.jsonl ledger.
+
+    Best-effort: a missing file or malformed line is skipped so a
+    pre-T3 store produces an empty list rather than crashing the
+    audit run.
+    """
+    p = Path(store_path) / "ledger" / "entity_bindings.jsonl"
+    if not p.exists():
+        return []
+    out: list[dict] = []
+    for line in p.read_text().splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            out.append(json.loads(line))
+        except Exception:
+            continue
+    return out
+
+
+def build_entity_binding_summary(rows: list[dict]) -> dict:
+    """Compute the T3.4 entity-binding summary from raw ledger rows.
+
+    Returns
+    -------
+    dict
+        ``per_kind``      — ``{kind: count}`` for ``entity_bound`` rows
+        ``ambiguous_total`` — total ``ambiguous_gated`` rows
+        ``ambiguous_by_tool`` — ``{tool: count}`` for ambiguous rows
+        ``total``         — total ``entity_bound`` rows
+    """
+    per_kind: dict[str, int] = {}
+    ambiguous_total = 0
+    ambiguous_by_tool: dict[str, int] = {}
+    bound_total = 0
+    for r in rows:
+        decision = r.get("decision", "")
+        if decision == "entity_bound":
+            bound_total += 1
+            kind = r.get("entity_kind")
+            if kind:
+                per_kind[kind] = per_kind.get(kind, 0) + 1
+        elif decision == "ambiguous_gated":
+            ambiguous_total += 1
+            tool = r.get("tool") or "(unknown)"
+            ambiguous_by_tool[tool] = ambiguous_by_tool.get(tool, 0) + 1
+    return {
+        "per_kind": per_kind,
+        "ambiguous_total": ambiguous_total,
+        "ambiguous_by_tool": ambiguous_by_tool,
+        "total": bound_total,
+    }
+
+
 # ── Stats ─────────────────────────────────────────────────────────────────
 
 
@@ -155,6 +214,11 @@ def build_report(store_path) -> dict:
         "label_missing": label_missing,
         "by_destination": dict(sorted(by_destination.items())),
         "ledger_rows": len(ledger),
+        # T3.4: entity-binding summary, read from entity_bindings.jsonl.
+        # Empty block (per_kind={}, ambiguous_total=0) when no rows exist
+        # so downstream renderers can branch on total == 0 cleanly.
+        "entity_bindings": build_entity_binding_summary(
+            load_entity_bindings(store_path)),
     }
 
 
@@ -192,6 +256,31 @@ def render(report: dict) -> str:
                     )
             if label_parts:
                 lines.append("      labels: " + ", ".join(label_parts))
+    # T3.4: entity-binding summary (per-kind + top ambiguous tools).
+    # The block is omitted when the ledger is empty so a pre-T3 store
+    # does not gain a noisy header.
+    eb = report.get("entity_bindings") or {}
+    eb_total = eb.get("total", 0)
+    ambig_total = eb.get("ambiguous_total", 0)
+    if eb_total or ambig_total:
+        lines.append("  entity bindings (T3.4):")
+        if eb_total:
+            per_kind = eb.get("per_kind", {})
+            kind_parts = [
+                f"{k}={v}" for k, v in sorted(per_kind.items())
+            ]
+            lines.append(
+                f"    bound total: {eb_total}  "
+                + (", ".join(kind_parts) if kind_parts else "(no kinds)")
+            )
+        if ambig_total:
+            lines.append(f"    ambiguous_gated total: {ambig_total}")
+            by_tool = sorted(
+                eb.get("ambiguous_by_tool", {}).items(),
+                key=lambda kv: (-kv[1], kv[0]),
+            )
+            for tool, count in by_tool:
+                lines.append(f"      top ambiguous: {tool} ({count})")
     return "\n".join(lines)
 
 
