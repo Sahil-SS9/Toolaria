@@ -10,6 +10,13 @@ import threading
 from pathlib import Path
 
 try:
+    import fcntl  # POSIX-only file locking for cross-process RMW safety.
+    _HAVE_FCNTL = True
+except ImportError:  # pragma: no cover - non-POSIX fallback path
+    fcntl = None  # type: ignore[assignment]
+    _HAVE_FCNTL = False
+
+try:
     from .excerpt import detect_type as _detect_type
     from .index import build_outline as _struct_outline
     from .index import render_outline as _render_outline
@@ -129,6 +136,40 @@ _LOCK = threading.Lock()
 _BLOB_ID_RE = re.compile(r"^[0-9a-f]{12}$")
 
 
+class _FlockAcquire:
+    """Context manager wrapping fcntl.flock(LOCK_EX) + release.
+
+    flock is a per-process, per-file-descriptor advisory lock:
+    re-acquiring an EX lock on the same fd is a no-op (it just
+    increments the per-process reference count), and closing any
+    fd to that file releases the lock. We open a dedicated fd per
+    charge so each release is independent, and we release via
+    LOCK_UN + close in __exit__ so a second process can acquire
+    immediately after this charge returns.
+    """
+    __slots__ = ("_fd", "_path", "_locked")
+
+    def __init__(self, fd, path):
+        self._fd = fd
+        self._path = path
+        self._locked = False
+
+    def __enter__(self):
+        if fcntl is None:
+            return self
+        fcntl.flock(self._fd, fcntl.LOCK_EX)
+        self._locked = True
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        if self._locked and fcntl is not None:
+            try:
+                fcntl.flock(self._fd, fcntl.LOCK_UN)
+            finally:
+                self._locked = False
+        return False
+
+
 class _SliceBudgetExceeded(Exception):
     """Internal control-flow signal raised by
     ``BlobStore._charge_slice_budget`` when the per-blob
@@ -209,6 +250,7 @@ class BlobStore:
         # parents=True (and thus skip the root chmod below).
         bp.mkdir(parents=True, exist_ok=True)
         _chmod_safe(bp, _DIR_MODE)
+        self.store_path = bp
         self.blob_dir = bp / "blobs"
         self.meta_dir = bp / "sessions"
         self.sidecar_dir = bp / "sidecars"
@@ -230,6 +272,24 @@ class BlobStore:
         self._load_fetch_log()
         # T1.2: sequences sidecar lazily created on first write when enabled.
         self._sequences_dir = bp / "sequences"
+        # RISKY-3 (Phase 4): dedicated lockfile for cross-process
+        # serialisation of credential-slice budget RMW. Eagerly
+        # touched at init so the lockfile exists from the moment
+        # the store is ready (an operator can `ls` it, and two
+        # concurrent processes can immediately race on it without
+        # the first charge paying the touch cost). The fcntl.flock
+        # is wrapped around the entire read-modify-write of
+        # credential_served_chars so two processes charging the same
+        # blob can't lose increments.
+        self._budget_lock_path = bp / ".budget.lock"
+        try:
+            self._budget_lock_path.touch(exist_ok=True)
+            _chmod_safe(self._budget_lock_path, _FILE_MODE)
+        except OSError as exc:
+            logger.debug(
+                "toolaria: could not pre-create .budget.lock at %s: %s",
+                self._budget_lock_path, exc,
+            )
 
     # ── sidecars (per-blob index/vector artefacts) ──
 
@@ -998,6 +1058,15 @@ class BlobStore:
         The counter is persisted on the calling session's index entry;
         sweeping clears it (see ``_sweep_by_ttl``). No-op when
         ``mask_slices`` is False (enforcement off, or non-credential blob).
+
+        RISKY-3 (Phase 4): the in-process threading.Lock is a thread
+        guard only. Two processes charging concurrently against the
+        same store path used to lose increments (verified: 100+100
+        -> 100). The RMW is now wrapped in an fcntl.flock on a
+        dedicated ``<store_path>/.budget.lock`` file so cross-process
+        charges serialise. The lockfile is created at init; non-POSIX
+        platforms (Windows native) skip the flock cleanly and rely on
+        the in-process lock with a DEBUG log.
         """
         if not mask_slices or not served:
             return
@@ -1008,8 +1077,57 @@ class BlobStore:
             return
         if not session_id:
             return
+        # RISKY-3: outer in-process lock + cross-process fcntl.flock.
+        # The threading.Lock keeps two threads in the same process
+        # from racing on the file descriptor; the fcntl.flock keeps
+        # two processes from racing on the same store path. Both are
+        # held across the entire read-modify-write so the budget
+        # never loses increments.
         with _LOCK:
-            ip = self._idx_path(session_id)
+            self._charge_slice_budget_locked(
+                blob_id, session_id, served, budget,
+            )
+
+    def _charge_slice_budget_locked(self, blob_id: str, session_id: str,
+                                      served: int, budget: int) -> None:
+        """Inner RMW for _charge_slice_budget. Caller holds _LOCK.
+
+        Separated so the outer lock + flock wrapping is clearly
+        distinct from the actual read-modify-write logic. This is
+        what serialises across processes.
+        """
+        ip = self._idx_path(session_id)
+        lock_path = self._budget_lock_path
+        lock_fd = None
+        flock_ctx = None
+        if _HAVE_FCNTL:
+            try:
+                # Best-effort chmod so the lockfile keeps the
+                # store-wide 0600 perms even if a previous install
+                # left it permissive.
+                _chmod_safe(lock_path, _FILE_MODE)
+                lock_fd = open(lock_path, "w")
+                flock_ctx = _FlockAcquire(lock_fd, lock_path)
+                flock_ctx.__enter__()
+            except OSError as exc:
+                logger.debug(
+                    "toolaria: could not acquire .budget.lock (%s); "
+                    "falling back to in-process _LOCK only: %s",
+                    lock_path, exc,
+                )
+                if lock_fd is not None:
+                    try:
+                        lock_fd.close()
+                    except OSError:
+                        pass
+                lock_fd = None
+                flock_ctx = None
+        else:  # pragma: no cover - non-POSIX fallback
+            logger.debug(
+                "toolaria: fcntl unavailable; cross-process budget "
+                "serialisation is best-effort (single-process _LOCK only)"
+            )
+        try:
             idx = self._read_idx_file(ip)
             entry = idx.get("blobs", {}).get(blob_id)
             if not entry or "swept_at" in entry:
@@ -1029,6 +1147,17 @@ class BlobStore:
                     (f"{_SLICE_BUDGET_MARKER_PREFIX}{blob_id}"
                      f"{_SLICE_BUDGET_MARKER_SUFFIX}"),
                 )
+        finally:
+            if flock_ctx is not None:
+                try:
+                    flock_ctx.__exit__(None, None, None)
+                except OSError:
+                    pass
+            if lock_fd is not None:
+                try:
+                    lock_fd.close()
+                except OSError:
+                    pass
 
     # ── grep with timeout/complexity cap ───
 
