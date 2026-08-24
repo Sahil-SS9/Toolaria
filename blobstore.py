@@ -290,6 +290,18 @@ class BlobStore:
                 "toolaria: could not pre-create .budget.lock at %s: %s",
                 self._budget_lock_path, exc,
             )
+        # CAREFUL (a) Phase 4: in-memory fallback accumulator so the
+        # budget is still enforced within the process when
+        # _write_idx_file fails (disk full, permission denied,
+        # operator-broken mount). Cleared on every successful
+        # persist so a transient failure does not silently inflate
+        # the in-memory tally.
+        self._budget_fallback: dict[str, int] = {}
+        # CAREFUL (b) Phase 4: log the legacy empty-session
+        # fallback at most once per process so the operator sees
+        # the legacy dispatcher is in use without spamming every
+        # charge with a WARNING line.
+        self._empty_session_logged = False
 
     # ── sidecars (per-blob index/vector artefacts) ──
 
@@ -1067,6 +1079,11 @@ class BlobStore:
         charges serialise. The lockfile is created at init; non-POSIX
         platforms (Windows native) skip the flock cleanly and rely on
         the in-process lock with a DEBUG log.
+
+        CAREFUL (b) Phase 4: legacy dispatchers that call with an
+        empty session_id now fall back to ``_global`` so they still
+        get budgeting. The fallback is logged at most once per
+        process.
         """
         if not mask_slices or not served:
             return
@@ -1075,8 +1092,17 @@ class BlobStore:
             _CREDENTIAL_SLICE_BUDGET_DEFAULT))
         if budget <= 0:
             return
-        if not session_id:
-            return
+        # CAREFUL (b): empty session_id from legacy dispatchers must
+        # still get budgeting. Fall back to a shared '_global' session
+        # so all such callers share one counter per blob.
+        effective_sid = session_id or "_global"
+        if not session_id and not self._empty_session_logged:
+            logger.info(
+                "toolaria: empty session_id passed to _charge_slice_budget; "
+                "falling back to '_global' budget (legacy dispatcher in "
+                "use — log emitted once per process)"
+            )
+            self._empty_session_logged = True
         # RISKY-3: outer in-process lock + cross-process fcntl.flock.
         # The threading.Lock keeps two threads in the same process
         # from racing on the file descriptor; the fcntl.flock keeps
@@ -1085,7 +1111,7 @@ class BlobStore:
         # never loses increments.
         with _LOCK:
             self._charge_slice_budget_locked(
-                blob_id, session_id, served, budget,
+                blob_id, effective_sid, served, budget,
             )
 
     def _charge_slice_budget_locked(self, blob_id: str, session_id: str,
@@ -1132,16 +1158,62 @@ class BlobStore:
             entry = idx.get("blobs", {}).get(blob_id)
             if not entry or "swept_at" in entry:
                 return
-            current = int(entry.get("credential_served_chars", 0) or 0)
+            # CAREFUL (a): int() coercion with a WARNING + clamp
+            # negative to 0, so a corrupted index can't crash the
+            # budget path or skew the counter.
+            raw_current = entry.get("credential_served_chars", 0)
+            try:
+                current = int(raw_current)
+            except (TypeError, ValueError):
+                logger.warning(
+                    "toolaria: credential_served_chars=%r for %s is not "
+                    "an integer; treating as 0",
+                    raw_current, blob_id,
+                )
+                current = 0
+            if current < 0:
+                logger.warning(
+                    "toolaria: credential_served_chars=%d for %s is "
+                    "negative; clamping to 0",
+                    current, blob_id,
+                )
+                current = 0
+            # CAREFUL (a): in-memory fallback tracks amounts that
+            # failed to persist in this process so a transient disk
+            # failure does not silently disable enforcement.
+            # - When the disk has caught up to (or past) our in-memory
+            #   tally, clear the fallback so we stop folding it.
+            # - When the disk is behind, fold the unpersisted amount
+            #   into ``current`` so the budget check sees the real
+            #   served total.
+            fallback = self._budget_fallback.get(blob_id, 0)
+            if fallback and current >= fallback:
+                self._budget_fallback.pop(blob_id, None)
+                fallback = 0
+            elif fallback:
+                # The disk counter represents the persisted portion;
+                # the in-memory fallback tracks what failed to land.
+                # effective = persisted + in-memory unpersisted.
+                current = current + fallback
             new_total = current + served
             entry["credential_served_chars"] = new_total
             try:
                 self._write_idx_file(ip, idx)
+                # Persist succeeded — the disk now reflects the new
+                # total; any in-memory fallback is obsolete.
+                self._budget_fallback.pop(blob_id, None)
             except Exception as exc:
-                logger.debug(
-                    "toolaria: slice-budget counter write failed for %s: %s",
+                # CAREFUL (a): WARNING (not DEBUG) and in-memory
+                # fallback so budgeting survives persistence loss
+                # within the process.
+                logger.warning(
+                    "toolaria: slice-budget counter write failed for %s "
+                    "(keeping in-memory accumulator; budget still "
+                    "enforced in-process): %s",
                     blob_id, exc,
                 )
+                self._budget_fallback[blob_id] = (
+                    self._budget_fallback.get(blob_id, 0) + served)
             if new_total > budget:
                 raise _SliceBudgetExceeded(
                     (f"{_SLICE_BUDGET_MARKER_PREFIX}{blob_id}"
