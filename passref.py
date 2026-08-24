@@ -431,13 +431,15 @@ def _replace_tokens_with_marker(args, marker: str):
     by *marker*. The shape is preserved (dict/list/str); non-tla
     values pass through unchanged.
 
-    The replacement string is treated literally (``re.sub`` does not
-    see backslashes in marker text), so the marker can contain ``\\``
-    or ``\\g<...>`` safely.
+    HG-002 (hermaguard Phase 3): the marker must be inserted as a
+    literal. A string replacement in ``re.sub`` expands ``\\1`` /
+    ``\\g<name>`` as backreferences, so a hostile registry ``kind``
+    could crash the middleware or inject matched text. The callable
+    form makes the marker always literal regardless of content.
     """
     def _walk(v):
         if isinstance(v, str):
-            return TOKEN_RE.sub(marker, v)
+            return TOKEN_RE.sub(lambda _m: marker, v)
         if isinstance(v, dict):
             return {k: _walk(vv) for k, vv in v.items()}
         if isinstance(v, list):
@@ -483,7 +485,19 @@ def make_middleware(get_store, cfg: dict, skip_tools: frozenset):
             )
             _entity_reg = []
         if _entity_reg:
-            matches = extract_entities(args, _entity_reg)
+            # HG-001/HG-003 (hermaguard Phase 3): the entity scan is
+            # best-effort on this path — a pathological registry regex
+            # hits its own time/length budget inside extract_entities,
+            # and any residual failure (e.g. deep-nested args) logs and
+            # degrades to no-bindings instead of crashing the request.
+            try:
+                matches = extract_entities(args, _entity_reg)
+            except Exception as exc:
+                logger.warning(
+                    "toolaria: entity scan failed for %s: %s; "
+                    "skipping binding/gate checks", tool_name, exc,
+                )
+                matches = []
             kinds = distinct_entity_kinds(matches)
             blob_ids = _blob_ids_in_args(args)
             # T3.2: observe-only binding rows, one per (tool, kind,

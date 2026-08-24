@@ -28,15 +28,65 @@ single O(1) list check — the feature stays byte-identical inert.
 """
 from __future__ import annotations
 
+import logging
 import re
+import time
 from typing import Any
 
 from labels import VALID_LABELS
+
+logger = logging.getLogger(__name__)
+
+# HG-001 (hermaguard Phase 3): bounds for the entity scan hot path.
+# Registry regexes are operator-supplied and can backtrack
+# catastrophically; the scan therefore never sees unbounded text and
+# never runs unbounded in wall-clock time. When the optional `regex`
+# engine is available (same dependency the grep path uses), every
+# registry regex runs through it with a hard mid-match timeout —
+# Python's `re` cannot be interrupted mid-search, so WITHOUT the
+# `regex` package a catastrophic pattern blocks once per string before
+# the budget aborts. To keep that worst case bounded, stdlib-compiled
+# registry regexes are additionally rejected if their pattern contains
+# nested quantifiers (the classic ReDoS shape).
+_ENTITY_SCAN_MAX_CHARS = 4096
+_ENTITY_SCAN_BUDGET_S = 0.25
+_ENTITY_REGEX_TIMEOUT_S = 0.05
+_ENTITY_SCAN_MAX_DEPTH = 64
+
+try:
+    import regex as _regex_engine  # type: ignore[import-not-found]
+except ImportError:  # pragma: no cover - fallback engine
+    _regex_engine = None
+
+# Nested-quantifier heuristic: quantifier directly applied to a group
+# that itself ends with a quantifier, e.g. (a+)+, (\\w+\\s?)*.
+_NESTED_QUANT_RE = re.compile(
+    r"\((?:[^()\\]|\\.)*[+*]\s*\)\s*[+*{]")
+
+
+def _compile_registry_regex(pattern: str):
+    """Compile *pattern*, preferring the timeout-honouring engine.
+
+    Returns the compiled pattern. When the `regex` package is present
+    it is used (its ``search``/``finditer`` accept a ``timeout=``
+    keyword that interrupts mid-match — Python's ``re`` cannot). Falls
+    back to ``re.compile`` otherwise; callers then rely on the length
+    + wall-clock budget as best-effort bounds.
+    """
+    if _regex_engine is not None:
+        return _regex_engine.compile(pattern)
+    return re.compile(pattern)
 
 
 # pattern_type is the only discriminated field; everything else is
 # plain metadata validated by type/format below.
 _ENTITY_PATTERN_TYPES = frozenset({"name", "regex"})
+
+# HG-002 / HG-006 (hermaguard Phase 3): ``kind`` reaches the
+# confirmation marker and audit keys, so it is restricted to a safe,
+# human-meaningful charset. Lowercase words with . - _ separators.
+_KIND_PATTERN = r"[a-z0-9][a-z0-9_.-]{0,63}"
+_KIND_RE = re.compile(_KIND_PATTERN)
 
 
 def parse_entity_registry(raw: Any) -> list[dict]:
@@ -89,6 +139,15 @@ def parse_entity_registry(raw: Any) -> list[dict]:
                 f"got {kind!r}"
             )
             continue
+        # HG-002 / HG-006 (hermaguard Phase 3): ``kind`` flows into the
+        # confirmation marker and audit grouping keys, so restrict it to
+        # a safe charset. This also blocks whitespace-only kinds.
+        if not _KIND_RE.fullmatch(kind):
+            errors.append(
+                f"entity_registry[{i}].kind must match "
+                f"{_KIND_PATTERN} (got {kind!r})"
+            )
+            continue
         if sensitivity not in VALID_LABELS:
             errors.append(
                 f"entity_registry[{i}].sensitivity must be one of "
@@ -97,14 +156,36 @@ def parse_entity_registry(raw: Any) -> list[dict]:
             continue
         compiled = None
         if ptype == "regex":
-            try:
-                compiled = re.compile(pattern)
-            except re.error as exc:
+            if _regex_engine is None and _NESTED_QUANT_RE.search(pattern):
+                # No timeout-capable engine installed: refuse the
+                # classic nested-quantifier ReDoS shape outright.
                 errors.append(
-                    f"entity_registry[{i}].pattern is not a valid regex: "
-                    f"{exc}"
+                    f"entity_registry[{i}].pattern uses a nested "
+                    f"quantifier (ReDoS risk) and the optional 'regex' "
+                    f"package is not installed; install 'regex' or "
+                    f"simplify the pattern"
                 )
                 continue
+            try:
+                compiled = _compile_registry_regex(pattern)
+            except TimeoutError:
+                errors.append(
+                    f"entity_registry[{i}].pattern timed out during "
+                    f"validation compile (catastrophic pattern?)"
+                )
+                continue
+            except Exception as exc:
+                # re.error and regex.error are both named `error` in
+                # their respective modules; catch engine-agnostically so
+                # the timeout-honouring engine's syntax failures are
+                # reported the same way as stdlib ones.
+                if type(exc).__name__ == "error":
+                    errors.append(
+                        f"entity_registry[{i}].pattern is not a valid "
+                        f"regex: {exc}"
+                    )
+                    continue
+                raise
         out.append({
             "pattern_type": ptype,
             "pattern": pattern,
@@ -154,7 +235,11 @@ def _match_entry(text: str, entry: dict) -> list[str]:
         if entry["pattern"].lower() in text.lower():
             return [entry["pattern"]]
         return []
-    return [m.group(0) for m in entry["regex"].finditer(text)]
+    # HG-001 (hermaguard Phase 3): bound the scan window. Registry
+    # regexes are operator-supplied and may backtrack catastrophically,
+    # so the entity scan never runs them against unbounded text.
+    return [m.group(0) for m in
+            entry["regex"].finditer(text[:_ENTITY_SCAN_MAX_CHARS])]
 
 
 def extract_entities(value: Any, registry: list[dict]) -> list[dict]:
@@ -164,6 +249,16 @@ def extract_entities(value: Any, registry: list[dict]) -> list[dict]:
     shape); the scan recurses so ``{"to": "alice", "meta": {"ref":
     "PR-7"}}`` is fully covered.
 
+    HG-001 (hermaguard Phase 3): each scanned string is truncated to
+    ``_ENTITY_SCAN_MAX_CHARS`` and total regex wall-clock time per
+    call is bounded by ``_ENTITY_SCAN_BUDGET_S`` — a catastrophic
+    registry pattern degrades to a partial (logged) result instead of
+    hanging the rescue path or the store's global lock.
+
+    HG-003 (hermaguard Phase 3): recursion depth is capped at
+    ``_ENTITY_SCAN_MAX_DEPTH``; deeper nesting simply stops yielding
+    new matches instead of raising RecursionError on the hot path.
+
     Each match is ``{"kind", "sensitivity", "value", "pattern_type"}``.
     Order is deterministic: registry order, then traversal order, with
     matches of the same registry entry emitted left-to-right within
@@ -171,26 +266,84 @@ def extract_entities(value: Any, registry: list[dict]) -> list[dict]:
     """
     if not registry:
         return []
+    deadline = time.monotonic() + _ENTITY_SCAN_BUDGET_S
+    try:
+        return _extract_entities_inner(value, registry, deadline, 0)
+    except _EntityScanBudgetExceeded:
+        logger.warning(
+            "toolaria: entity scan exceeded %.3fs budget; "
+            "returning empty match set for this request",
+            _ENTITY_SCAN_BUDGET_S,
+        )
+        return []
+
+
+class _EntityScanBudgetExceeded(Exception):
+    """Raised internally when the entity scan exceeds its time budget."""
+
+
+def _extract_entities_inner(value: Any, registry: list[dict],
+                            deadline: float, depth: int) -> list[dict]:
+    if time.monotonic() > deadline:
+        raise _EntityScanBudgetExceeded()
+    if depth > _ENTITY_SCAN_MAX_DEPTH:
+        return []
     if isinstance(value, str):
         out: list[dict] = []
         for entry in registry:
-            for matched in _match_entry(value, entry):
-                out.append({
-                    "kind": entry["kind"],
-                    "sensitivity": entry["sensitivity"],
-                    "value": matched,
-                    "pattern_type": entry["pattern_type"],
-                })
+            if entry["pattern_type"] != "regex":
+                # name matching is linear substring search; no budget risk
+                for matched in _match_entry(value, entry):
+                    out.append({
+                        "kind": entry["kind"],
+                        "sensitivity": entry["sensitivity"],
+                        "value": matched,
+                        "pattern_type": entry["pattern_type"],
+                    })
+                continue
+            text = value[:_ENTITY_SCAN_MAX_CHARS]
+            try:
+                for m in entry["regex"].finditer(
+                        text, timeout=_ENTITY_REGEX_TIMEOUT_S):
+                    out.append({
+                        "kind": entry["kind"],
+                        "sensitivity": entry["sensitivity"],
+                        "value": m.group(0),
+                        "pattern_type": entry["pattern_type"],
+                    })
+            except TimeoutError:
+                # `regex`-engine per-match timeout fired (HG-001):
+                # treat this pattern as exhausted for this string and
+                # keep scanning the rest of the registry.
+                logger.warning(
+                    "toolaria: entity registry regex for kind=%r timed "
+                    "out mid-scan; pattern skipped for this value",
+                    entry["kind"],
+                )
+            except TypeError:
+                # stdlib `re` fallback: no timeout kwarg. The wall-clock
+                # budget checked after this call is then best-effort.
+                for m in entry["regex"].finditer(text):
+                    out.append({
+                        "kind": entry["kind"],
+                        "sensitivity": entry["sensitivity"],
+                        "value": m.group(0),
+                        "pattern_type": entry["pattern_type"],
+                    })
+            if time.monotonic() > deadline:
+                raise _EntityScanBudgetExceeded()
         return out
     if isinstance(value, dict):
         out = []
         for v in value.values():
-            out.extend(extract_entities(v, registry))
+            out.extend(
+                _extract_entities_inner(v, registry, deadline, depth + 1))
         return out
     if isinstance(value, (list, tuple)):
         out = []
         for v in value:
-            out.extend(extract_entities(v, registry))
+            out.extend(
+                _extract_entities_inner(v, registry, deadline, depth + 1))
         return out
     return []
 
