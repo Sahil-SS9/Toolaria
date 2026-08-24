@@ -387,12 +387,16 @@ ENTITY_CONFIRMATION_MARKER = (
 def _confirmation_marker(kinds: list[str]) -> str:
     """T3.3: build the deterministic confirmation marker for ``kinds``.
 
-    ``kinds`` is the sorted distinct kind list. Output is exact and
-    stable — the audit script can match on the literal prefix and the
-    ``<kinds>`` substring to attribute ambiguous-gated requests.
+    ``kinds`` is sorted defensively (callers already pass sorted
+    distinct kinds via ``distinct_entity_kinds``; sorting again here
+    means a hand-built test list still produces the canonical output).
+    Output is exact and stable — the audit script can match on the
+    literal prefix and the ``<kinds>`` substring to attribute
+    ambiguous-gated requests.
     """
     return ENTITY_CONFIRMATION_MARKER.format(
-        n=len(kinds), kinds=ENTITY_CONFIRMATION_MARKER_SEP.join(kinds))
+        n=len(kinds), kinds=ENTITY_CONFIRMATION_MARKER_SEP.join(
+            sorted(kinds)))
 
 
 def _blob_ids_in_args(args) -> list[str]:
