@@ -1344,8 +1344,17 @@ class BlobStore:
                     # "since the last sweep reset" so a long-running
                     # blob's budget is not exhausted by yesterday's
                     # reads.
-                    if meta.get("label") == "credential":
-                        meta.pop("credential_served_chars", None)
+                    #
+                    # RISKY-2 (Phase 4): the counter used to be popped
+                    # BEFORE the TTL-expiry check below, so a sweep
+                    # that expired nothing still wiped live budgets —
+                    # and lazy_sweep runs on session start AND end so
+                    # budgets were reset twice per session without any
+                    # TTL work. The counter now drops naturally inside
+                    # the tombstone-transition branch (the fresh
+                    # tombstone dict below explicitly lists only
+                    # swept_at/tool/size/label), so we no longer pop
+                    # it here.
                     if now - meta.get("t", 0) > effective_ttl:
                         blobs[bid] = {
                             "swept_at": now,
