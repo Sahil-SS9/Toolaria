@@ -15,14 +15,35 @@ try:
     from .index import render_outline as _render_outline
     from .chunking import chunk_lines as _chunk_lines
     from . import semantic as _sem
-    from .labels import label_for_tool, label_for_args as _label_for_args
+    from .labels import (label_for_tool, label_for_args as _label_for_args,
+                          VALID_LABELS, _LABEL_UPGRADE_PATTERNS,
+                          _BUILTIN_TOOL_LABELS)
 except ImportError:
     from excerpt import detect_type as _detect_type  # type: ignore[no-redef]
     from index import build_outline as _struct_outline  # type: ignore[no-redef]
     from index import render_outline as _render_outline  # type: ignore[no-redef]
     from chunking import chunk_lines as _chunk_lines  # type: ignore[no-redef]
     import semantic as _sem  # type: ignore[no-redef]
-    from labels import label_for_tool, label_for_args as _label_for_args  # type: ignore[no-redef]
+    from labels import (label_for_tool, label_for_args as _label_for_args,  # type: ignore[no-redef]
+                         VALID_LABELS, _LABEL_UPGRADE_PATTERNS,  # type: ignore[no-redef]
+                         _BUILTIN_TOOL_LABELS)  # type: ignore[no-redef]
+
+
+# Sensitivity ordering for content-aware label resolution (FIX-1). The
+# highest index in this tuple wins when comparing two labels; this is the
+# single source of truth for "credential > personal > internal > public"
+# comparisons in BlobStore (and is mirrored in passref for fail-closed
+# label lookup).
+_LABEL_SENSITIVITY = {"public": 0, "internal": 1, "personal": 2,
+                       "credential": 3}
+_SLICE_MASK_MARKER = "[masked:credential-shape]"
+_SLICE_BUDGET_MARKER_PREFIX = (
+    "[Toolaria: credential slice budget exhausted for "
+)
+_SLICE_BUDGET_MARKER_SUFFIX = (
+    "; use allowlisted destinations]"
+)
+_CREDENTIAL_SLICE_BUDGET_DEFAULT = 2000
 
 
 # ── Phase 1 helpers (T1.3 redaction, T1.4 integrity marker) ─────────────
@@ -99,6 +120,19 @@ def _scrub(value):
 
 _LOCK = threading.Lock()
 _BLOB_ID_RE = re.compile(r"^[0-9a-f]{12}$")
+
+
+class _SliceBudgetExceeded(Exception):
+    """Internal control-flow signal raised by
+    ``BlobStore._charge_slice_budget`` when the per-blob
+    credential-slice byte budget has been exceeded. The fetch()
+    dispatcher catches this and returns the deterministic budget-
+    exhausted marker to the caller."""
+
+    def __init__(self, marker: str):
+        super().__init__(marker)
+        self.marker = marker
+
 
 # Phase 0 hardening (T0.1): explicit perms on every file/dir created by the
 # store. mkdir and write_bytes honour umask, so a permissive umask (or a
@@ -331,7 +365,7 @@ class BlobStore:
     # ── blob i/o ──────────────────────────
 
     def put(self, content: str, tool_name: str = "", session_id: str = "",
-            args=None, label: str | None = None) -> str:
+            args=None, label=None) -> str:
         """Store content, return short blob_id (first 12 hex of SHA256).
 
         *session_id* is the owning session; callers must pass it so the
@@ -350,7 +384,15 @@ class BlobStore:
         args-shape. When provided, it bypasses the tool/args heuristic
         and is stored verbatim. Useful for callers that have already
         classified (e.g. the host dispatch layer consulting
-        ``label_for_args`` before the rescue fires)."""
+        ``label_for_args`` before the rescue fires).
+
+        FIX-1 (Phase 3): the label is content-owned, not session-owned.
+        ``put()`` NEVER downgrades an existing higher label on the
+        same blob_id in this session's index, and when stamping a new
+        entry it carries the max across every session that already
+        holds the blob — so a credential rescue is preserved across
+        re-rescue of identical bytes through a public tool.
+        """
         if isinstance(content, str):
             raw = content.encode("utf-8")
         else:
@@ -370,25 +412,59 @@ class BlobStore:
         # args-shape. label_for_args never downgrades, so passing an
         # operator-configured "personal" through the args heuristic still
         # yields "personal" (or "credential" if args look secret-shaped).
-        if label is None:
-            tool_label = label_for_tool(tool_name, self.cfg)
-            label = _label_for_args(args, tool_label, self.cfg)
-        else:
-            # Explicit label still respects args-shape upgrade — but only
-            # if the caller hasn't already gone to the ceiling. A "public"
-            # explicit that gets credential-shaped args becomes
-            # credential; "credential" stays credential. Downgrade is
-            # never implied by an explicit (operator-set) label.
-            tool_label = label_for_tool(tool_name, self.cfg)
-            label = _label_for_args(args, label, self.cfg) \
-                if label != "credential" else label
-            _ = tool_label  # used implicitly via label_for_args above
+        #
+        # FIX-4 hardening: a bad operator map could raise here; wrap the
+        # resolution in try/except so the rescue path never crashes —
+        # fall back to built-in defaults with a WARNING.
+        try:
+            if label is None:
+                tool_label = label_for_tool(tool_name, self.cfg)
+                resolved = _label_for_args(args, tool_label, self.cfg)
+            else:
+                # Explicit label still respects args-shape upgrade — but only
+                # if the caller hasn't already gone to the ceiling. A "public"
+                # explicit that gets credential-shaped args becomes
+                # credential; "credential" stays credential. Downgrade is
+                # never implied by an explicit (operator-set) label.
+                tool_label = label_for_tool(tool_name, self.cfg)
+                resolved = (_label_for_args(args, label, self.cfg)
+                            if label != "credential" else label)
+                _ = tool_label  # used implicitly via label_for_args above
+        except Exception as exc:
+            logger.warning(
+                "toolaria: label resolution failed for %s (tool=%s): %s; "
+                "falling back to built-in defaults",
+                bid, tool_name, exc,
+            )
+            try:
+                tool_label = _BUILTIN_TOOL_LABELS.get(tool_name or "", "public")
+                resolved = _label_for_args(args, tool_label, self.cfg)
+            except Exception:
+                resolved = "public"
+        label = resolved
         with _LOCK:
             if not bpath.exists():
                 bpath.write_bytes(raw)
                 _chmod_safe(bpath, _FILE_MODE)
             idx = self._load_idx(sid)
             idx.setdefault("blobs", {})
+            existing = idx["blobs"].get(bid, {})
+            # FIX-1 upgrade-only: never overwrite a higher existing label
+            # in THIS session's index with a lower one. Cross-session max
+            # is computed below via the per-blob scan.
+            new_rank = self._label_rank(label)
+            existing_rank = self._label_rank(existing.get("label"))
+            # Cross-session max label (FIX-1): if any other session holds
+            # a higher label for the same blob_id, the new entry must
+            # carry that max so this session's lookup also sees it.
+            cross_max = self._max_label_for_blob(bid)
+            cross_rank = self._label_rank(cross_max)
+            final_rank = max(new_rank, existing_rank, cross_rank)
+            final_label = label
+            for candidate in (existing.get("label"), cross_max):
+                if self._label_rank(candidate) == final_rank:
+                    final_label = candidate
+                    break
             idx["blobs"][bid] = {
                 "t": time.time(),
                 "tool": tool_name,
@@ -398,10 +474,63 @@ class BlobStore:
                 # T2.1: persist label alongside other metadata. Kept on
                 # tombstones (D3) so the audit script can report flow
                 # even after sweeps.
-                "label": label,
+                "label": final_label,
             }
+            # FIX-2: credential-slice cumulative-chars counter (resets on
+            # sweep). Seed on first put so the budget lookup is O(1).
+            if final_label == "credential":
+                idx["blobs"][bid].setdefault("credential_served_chars", 0)
             self._save_idx(idx, sid)
         return bid
+
+    def backfill_labels(self) -> None:
+        """Phase-3 migration: walk every index entry lacking a label and
+        stamp it from ``label_for_tool`` + ``label_for_args``.
+
+        Called from ``register()`` so a pre-T2.1 store comes up with
+        labels everywhere — under ``enforcement_enabled=True``, a
+        label-less entry must NOT fall back to 'public' (fail-closed);
+        the migration is what makes fail-closed safe.
+
+        Best-effort: a malformed entry is logged and skipped (we never
+        break load for an unclassifiable record).
+        """
+        for ip in sorted(self.meta_dir.glob("*.json")):
+            try:
+                idx = self._read_idx_file(ip)
+            except Exception as exc:
+                logger.warning(
+                    "toolaria: backfill could not read %s: %s", ip, exc)
+                continue
+            blobs = idx.get("blobs", {})
+            changed = False
+            for bid, entry in list(blobs.items()):
+                if not isinstance(entry, dict):
+                    continue
+                if entry.get("label") in VALID_LABELS:
+                    continue
+                try:
+                    tool_name = entry.get("tool", "") or ""
+                    tool_label = label_for_tool(tool_name, self.cfg)
+                    snap = entry.get("args_snapshot")
+                    label = _label_for_args(snap, tool_label, self.cfg)
+                except Exception as exc:
+                    logger.warning(
+                        "toolaria: backfill classify failed for %s/%s: %s; "
+                        "defaulting to 'public'",
+                        ip.stem, bid, exc,
+                    )
+                    label = "public"
+                entry["label"] = label
+                changed = True
+            if changed:
+                try:
+                    self._write_idx_file(ip, idx)
+                except Exception as exc:
+                    logger.warning(
+                        "toolaria: backfill could not write %s: %s",
+                        ip, exc,
+                    )
 
     def _refresh_blob(self, blob_id: str, session_id: str,
                        turn: int | None = None) -> None:
@@ -519,6 +648,43 @@ class BlobStore:
             .get("blobs", {}).get(blob_id)
         return bool(entry) and "swept_at" not in entry
 
+    @staticmethod
+    def _label_rank(label) -> int:
+        """Return the sensitivity rank (0..3) of *label*, or -1 for
+        unknown / None. Used by the content-aware label comparator."""
+        if not label:
+            return -1
+        return _LABEL_SENSITIVITY.get(label, -1)
+
+    def _max_label_for_blob(self, blob_id: str):
+        """Return the highest-sensitivity label present for *blob_id*
+        across every session index (live + tombstone).
+
+        The label is a property of the content (blob_id = SHA256 prefix),
+        NOT of the session. Two sessions that rescue the same bytes
+        through different tool classes store different labels for the
+        same blob_id; the enforcement gate must consult the highest of
+        those — never just the calling-session's entry.
+
+        Order: credential > personal > internal > public. Returns
+        ``None`` if no session holds an entry for the blob at all.
+        """
+        best_rank = -1
+        best_label = None
+        # Scan every session index (sorted for determinism; the rank
+        # comparison is what actually decides the winner).
+        for ip in sorted(self.meta_dir.glob("*.json")):
+            idx = self._read_idx_file(ip)
+            entry = idx.get("blobs", {}).get(blob_id)
+            if not entry:
+                continue
+            label = entry.get("label")
+            rank = self._label_rank(label)
+            if rank > best_rank:
+                best_rank = rank
+                best_label = label
+        return best_label
+
     def _find_meta(self, blob_id: str, session_id: str = "",
                    include_swept: bool = False) -> dict:
         """Index metadata for a blob: the given session's entry, or the first
@@ -566,20 +732,31 @@ class BlobStore:
                 return tomb
             return f"Error: blob {blob_id} not found (may have been swept)"
 
-        # Touch the blob so an actively-used result does not expire mid-task.
-        self._refresh_blob(blob_id, session_id)
-
-        # T2.3: enforcement ON + credential label → full reads are refused
-        # with the exact deterministic marker; slices (range/grep/search/
-        # outline/stat) stay available. Gate sits after session scoping and
-        # before any byte read, so no code path returns full content.
+        # T2.3 + Phase 3 FIX-1 + FIX-3 + gate ordering (Phase 3 MEDIUM):
+        # the credential gate runs BEFORE _refresh_blob so a refused
+        # full-fetch does not bump fetch_count or stamp first_fetch_ts
+        # (the gate is a pure refusal, not a content read). FIX-1 also
+        # requires the label to be content-aware: we read the max label
+        # across every session index, not just the calling session's
+        # entry, so a credential blob that was re-rescued as public in
+        # another session is still gated here.
         if (self._enforcement_enabled() and mode == "full"):
-            meta = self._find_meta(blob_id, session_id) or {}
-            if meta.get("label") == "credential":
+            blob_label = self._max_label_for_blob(blob_id)
+            # FIX-3 fail-closed: under enforcement ON, an unresolved
+            # label (None / missing everywhere) is treated as
+            # credential, never as public. Under enforcement OFF the
+            # per-session entry resolves as before so audit runs on
+            # mixed-version stores.
+            if blob_label is None:
+                blob_label = "credential"
+            if blob_label == "credential":
                 from passref import (CREDENTIAL_REFUSE_MARKER_PREFIX,
                                      CREDENTIAL_REFUSE_MARKER_SUFFIX)
                 return (f"{CREDENTIAL_REFUSE_MARKER_PREFIX}{blob_id}"
                         f"{CREDENTIAL_REFUSE_MARKER_SUFFIX}")
+
+        # Touch the blob so an actively-used result does not expire mid-task.
+        self._refresh_blob(blob_id, session_id)
 
         try:
             if mode == "stat":
@@ -627,8 +804,33 @@ class BlobStore:
         if mode == "outline":
             return self._outline(blob_id, text)
 
+        # Phase 3 FIX-2: under enforcement ON + credential label, slices
+        # (range/grep/search/chain) must MASK credential-shaped lines so
+        # paging cannot reconstruct the secret via repeated slice reads.
+        # The structural-only modes (outline/stat) are already safe and
+        # untouched. Non-matching lines pass through unchanged; line
+        # count is preserved so paging semantics still work for the
+        # operator.
+        mask_slices = (self._enforcement_enabled()
+                        and self._max_label_for_blob(blob_id) == "credential")
+
         if mode == "search":
-            return self.search(blob_id, query or "", text)
+            # Phase 3 FIX-2: under enforcement + credential, mask the
+            # snippets too. The search output is post-filtered for any
+            # line that triggers a credential-shape pattern.
+            result = self.search(blob_id, query or "", text)
+            if mask_slices:
+                masked_lines = self._mask_lines(result.splitlines())
+                result = "\n".join(masked_lines)
+            # Charge the budget for the served chars (masked or not).
+            try:
+                self._charge_slice_budget(
+                    blob_id, session_id, len(result),
+                    mask_slices=mask_slices,
+                )
+            except _SliceBudgetExceeded as exc:
+                return exc.marker
+            return result
 
         if mode == "full":
             max_full = self.cfg.get("full_fetch_max_chars", 50000)
@@ -642,6 +844,19 @@ class BlobStore:
 
         lines = text.splitlines()
 
+        try:
+            return self._dispatch_slice(
+                mode, blob_id, session_id, lines, start, count, pattern, cap,
+                mask_slices=mask_slices,
+            )
+        except _SliceBudgetExceeded as exc:
+            return exc.marker
+
+    def _dispatch_slice(self, mode, blob_id, session_id, lines, start, count,
+                         pattern, cap, *, mask_slices: bool):
+        """Phase-3 slice dispatcher. Wraps the per-mode logic in one
+        place so the budget-exceeded signal is raised consistently
+        regardless of which slice mode fired."""
         if mode == "range":
             total = len(lines)
             start = max(0, start)
@@ -650,7 +865,13 @@ class BlobStore:
                 note = f"[start {start} past end; clamped]\n"
                 start = max(0, total - max(1, count))
             end = min(total, start + max(1, count))
-            body = "\n".join(lines[start:end])[:cap]
+            slice_lines = lines[start:end]
+            if mask_slices:
+                slice_lines = self._mask_lines(slice_lines)
+            body = "\n".join(slice_lines)[:cap]
+            served = len(body)
+            self._charge_slice_budget(blob_id, session_id, served,
+                                       mask_slices=mask_slices)
             return (
                 f"{note}[lines {start}..{end - 1} of {total}]\n{body}"
             )
@@ -658,12 +879,116 @@ class BlobStore:
         if mode == "grep":
             if not pattern:
                 return "Error: grep requires pattern=..."
-            return self._grep_safe(lines, pattern, cap)
+            matched, served = self._grep_with_mask(
+                lines, pattern, cap, mask_lines=mask_slices)
+            self._charge_slice_budget(blob_id, session_id, served,
+                                       mask_slices=mask_slices)
+            return matched
 
         if mode == "chain":
-            return self._chain(lines, pattern, count, cap)
+            matched, served = self._chain_with_mask(
+                lines, pattern, count, cap, mask_lines=mask_slices)
+            self._charge_slice_budget(blob_id, session_id, served,
+                                       mask_slices=mask_slices)
+            return matched
 
         return f"Error: unknown mode '{mode}'"
+
+    # ── credential-slice masking helpers (Phase 3 FIX-2) ─────────────
+
+    @staticmethod
+    def _mask_lines(lines) -> list:
+        """Replace any line whose text matches a credential-upgrade
+        pattern with the structural mask marker; preserve line count."""
+        out = []
+        for ln in lines:
+            text = ln[:2000] if isinstance(ln, str) else ""
+            if any(p.search(text) for p in _LABEL_UPGRADE_PATTERNS):
+                out.append(_SLICE_MASK_MARKER)
+            else:
+                out.append(ln)
+        return out
+
+    def _grep_with_mask(self, lines, pattern, cap, *, mask_lines: bool):
+        """Grep helper that respects the FIX-2 mask contract: matched
+        lines that are credential-shaped are returned as the mask
+        marker instead of the raw text, but the line-number prefix and
+        the body layout are preserved so paging still works. Returns
+        (output, served_chars)."""
+        if not mask_lines:
+            return self._grep_safe(lines, pattern, cap), 0
+        # Run grep with a generous cap so we can post-filter without
+        # losing line numbers; we'll re-cap after masking.
+        raw = self._grep_safe(lines, pattern, cap * 4)
+        out_lines: list = []
+        for ln in raw.splitlines():
+            if ": " in ln and ln.split(": ", 1)[0].isdigit():
+                n, body = ln.split(": ", 1)
+                if any(p.search(body[:2000]) for p in _LABEL_UPGRADE_PATTERNS):
+                    out_lines.append(f"{n}: {_SLICE_MASK_MARKER}")
+                    continue
+            out_lines.append(ln)
+        out = "\n".join(out_lines)
+        if len(out) > cap:
+            out = out[:cap]
+        return out, min(len(out), cap)
+
+    def _chain_with_mask(self, lines, pattern, count, cap, *, mask_lines: bool):
+        """Chain helper with the same FIX-2 masking contract as grep."""
+        if not mask_lines:
+            return self._chain(lines, pattern, count, cap), 0
+        raw = self._chain(lines, pattern, count, cap * 4)
+        out_lines: list = []
+        for ln in raw.splitlines():
+            if any(p.search(ln[:2000]) for p in _LABEL_UPGRADE_PATTERNS):
+                out_lines.append(_SLICE_MASK_MARKER)
+            else:
+                out_lines.append(ln)
+        out = "\n".join(out_lines)
+        if len(out) > cap:
+            out = out[:cap]
+        return out, min(len(out), cap)
+
+    def _charge_slice_budget(self, blob_id: str, session_id: str,
+                              served: int, *, mask_slices: bool) -> None:
+        """FIX-2: track cumulative chars served for *blob_id* since the
+        last sweep reset. Refuse further slice reads once
+        ``credential_slice_total_max_chars`` is exceeded.
+
+        The counter is persisted on the calling session's index entry;
+        sweeping clears it (see ``_sweep_by_ttl``). No-op when
+        ``mask_slices`` is False (enforcement off, or non-credential blob).
+        """
+        if not mask_slices or not served:
+            return
+        budget = int(self.cfg.get(
+            "credential_slice_total_max_chars",
+            _CREDENTIAL_SLICE_BUDGET_DEFAULT))
+        if budget <= 0:
+            return
+        if not session_id:
+            return
+        with _LOCK:
+            ip = self._idx_path(session_id)
+            idx = self._read_idx_file(ip)
+            entry = idx.get("blobs", {}).get(blob_id)
+            if not entry or "swept_at" in entry:
+                return
+            current = int(entry.get("credential_served_chars", 0) or 0)
+            new_total = current + served
+            entry["credential_served_chars"] = new_total
+            try:
+                self._write_idx_file(ip, idx)
+            except Exception as exc:
+                logger.debug(
+                    "toolaria: slice-budget counter write failed for %s: %s",
+                    blob_id, exc,
+                )
+            if new_total > budget:
+                raise _SliceBudgetExceeded(
+                    (f"{_SLICE_BUDGET_MARKER_PREFIX}{blob_id}"
+                     f"{_SLICE_BUDGET_MARKER_SUFFIX}"),
+                )
 
     # ── grep with timeout/complexity cap ───
 
@@ -813,9 +1138,52 @@ class BlobStore:
     def _is_live(entry: dict) -> bool:
         return "swept_at" not in entry
 
+    @staticmethod
+    def _truthy(value) -> bool:
+        """Phase 3 MEDIUM bool-coercion helper.
+
+        YAML-parsed config values are strings unless quoted correctly:
+        ``enforcement_enabled: "false"`` (quoted) lands as the string
+        ``"false"`` in Python, and ``bool("false")`` is ``True``. The
+        enforcement gates use explicit truthy semantics so a quoted
+        ``"false"`` actually disables the gate.
+
+        Truthy set: ``{"1", "true", "yes", "on"}`` (case-insensitive).
+        Anything else (including the empty string, ``"0"``, ``"no"``,
+        ``"off"``, ``None``) is False.
+        """
+        if isinstance(value, bool):
+            return value
+        if not isinstance(value, str):
+            return bool(value)
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+
     def _enforcement_enabled(self) -> bool:
-        """T2.3: master switch for credential-grade enforcement."""
-        return bool(self.cfg.get("enforcement_enabled", False))
+        """T2.3: master switch for credential-grade enforcement.
+
+        Phase 3 MEDIUM: explicit truthy semantics (not bare bool()) so
+        a YAML-quoted ``"false"`` actually disables the gate."""
+        return self._truthy(self.cfg.get("enforcement_enabled", False))
+
+    def _credential_ttl_seconds(self) -> int:
+        """Eagerly coerce ``credential_ttl_hours`` (Phase 3 MEDIUM).
+
+        A quoted-string ``"24"`` or ``None`` from YAML previously
+        crashed the sweep with a TypeError inside
+        ``min(int, str)``. Coerce via try/except, fall back to the
+        24h default with a WARNING so the sweep always completes."""
+        raw = self.cfg.get("credential_ttl_hours", 24)
+        try:
+            n = int(raw)
+            if n <= 0:
+                raise ValueError("non-positive")
+            return n * 3600
+        except Exception as exc:
+            logger.warning(
+                "toolaria: credential_ttl_hours=%r is not a positive "
+                "integer (%s); falling back to 24h", raw, exc,
+            )
+            return 24 * 3600
 
     def _audit_summary(self, count: int = 20) -> str:
         """T2.2: read-only last-N expansion ledger summary for /rescuer audit.
@@ -823,7 +1191,26 @@ class BlobStore:
         Reads the JSONL expansion ledger directly — no blob bytes are
         touched and no fetch counters move. Degrades to a friendly line
         when the ledger is absent or empty.
+
+        Phase 3 MEDIUM: ``count`` is clamped to ``[0..1000]`` and any
+        value ``<= 0`` is treated as "return the friendly empty message"
+        so a request for "the last 0 events" no longer returns the full
+        ledger mislabeled. Memory is bounded by the clamped count via
+        ``collections.deque(maxlen=n)`` so the function's I/O cost is
+        also bounded.
         """
+        # Clamp first — empty/stupid requests short-circuit to the
+        # friendly line before any I/O so a misconfigured operator
+        # can't accidentally pull unbounded rows.
+        try:
+            n = int(count)
+        except Exception:
+            n = 0
+        if n <= 0:
+            return ("Toolaria audit: no data yet "
+                    "(count must be a positive integer; got "
+                    f"{count!r}).")
+        n = min(n, 1000)
         ledger = self.meta_dir.parent / "ledger" / "expansions.jsonl"
         if not ledger.exists():
             return ("Toolaria audit: no data yet "
@@ -831,20 +1218,25 @@ class BlobStore:
         rows: list[dict] = []
         try:
             with open(ledger, "r", encoding="utf-8") as fh:
+                # Stream the tail so memory stays bounded by ``n``,
+                # not by the lifetime of the ledger.
+                from collections import deque
+                tail: "deque[dict]" = deque(maxlen=n)
                 for line in fh:
                     line = line.strip()
                     if not line:
                         continue
                     try:
-                        rows.append(json.loads(line))
+                        tail.append(json.loads(line))
                     except json.JSONDecodeError:
                         continue  # skip malformed lines, keep summarising
+                rows = list(tail)
         except OSError:
             return "Toolaria audit: ledger unreadable (I/O error)."
         if not rows:
             return "Toolaria audit: ledger present but empty."
         by_dst: dict[str, dict] = {}
-        for row in rows[-count:]:
+        for row in rows:
             dst = row.get("dst_tool", "?")
             slot = by_dst.setdefault(
                 dst, {"expanded": 0, "denied": 0, "chars": 0})
@@ -853,7 +1245,7 @@ class BlobStore:
                 slot["chars"] += row.get("chars", 0) or 0
             else:
                 slot["denied"] += 1
-        lines = [f"Toolaria audit (last {min(count, len(rows))} events):"]
+        lines = [f"Toolaria audit (last {len(rows)} events):"]
         for dst, slot in sorted(by_dst.items(),
                                 key=lambda kv: -kv[1]["expanded"]):
             lines.append(
@@ -897,12 +1289,23 @@ class BlobStore:
                     # T2.3: credential-labelled blobs have a hard 24h TTL
                     # that overrides hot-pinning — an actively-fetched
                     # credential must still age out on schedule.
+                    # Phase 3 MEDIUM: credential_ttl_hours is eagerly
+                    # coerced (see _credential_ttl_seconds) so a bad
+                    # value falls back to 24h instead of crashing the
+                    # sweep with TypeError.
                     if (self._enforcement_enabled()
                             and meta.get("label") == "credential"):
                         effective_ttl = min(
                             effective_ttl,
-                            self.cfg.get("credential_ttl_hours", 24) * 3600,
+                            self._credential_ttl_seconds(),
                         )
+                    # Phase 3 FIX-2: reset the credential-slice budget
+                    # counter on every live entry — the budget is
+                    # "since the last sweep reset" so a long-running
+                    # blob's budget is not exhausted by yesterday's
+                    # reads.
+                    if meta.get("label") == "credential":
+                        meta.pop("credential_served_chars", None)
                     if now - meta.get("t", 0) > effective_ttl:
                         blobs[bid] = {
                             "swept_at": now,
