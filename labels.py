@@ -77,9 +77,12 @@ _LABEL_UPGRADE_PATTERNS = (
 def _parse_tool_label_map(raw: Any) -> dict[str, str]:
     """Validate an operator-supplied sensitivity_tool_labels map.
 
-    Non-list-of-string-pairs raises ValueError so a broken operator
-    config fails loud at the first call rather than silently widening
-    the classification. Empty / None is a valid no-op.
+    A malformed operator config raises ``ValueError`` so a broken
+    config fails loud at register time (Phase 3 FIX-4). All offending
+    entries are accumulated and reported in a single message so the
+    operator sees the full list of typos, not one-at-a-time.
+
+    Empty / None is a valid no-op.
     """
     if raw is None:
         return {}
@@ -89,18 +92,25 @@ def _parse_tool_label_map(raw: Any) -> dict[str, str]:
             f"to label, got {type(raw).__name__}"
         )
     out: dict[str, str] = {}
+    errors: list[str] = []
     for k, v in raw.items():
         if not isinstance(k, str) or not isinstance(v, str):
-            raise ValueError(
-                "sensitivity_tool_labels entries must be string→string; "
-                f"got {k!r}={v!r}"
-            )
+            errors.append(f"entry must be string→string; got {k!r}={v!r}")
+            continue
         if v not in VALID_LABELS:
-            raise ValueError(
+            errors.append(
                 f"sensitivity_tool_labels[{k!r}]={v!r} is not a valid "
                 f"label; choose from {sorted(VALID_LABELS)}"
             )
+            continue
         out[k] = v
+    if errors:
+        # All bad entries in one message so the operator fixes them in
+        # one pass instead of N register-reload cycles.
+        raise ValueError(
+            "sensitivity_tool_labels has invalid entries: "
+            + "; ".join(errors)
+        )
     return out
 
 
