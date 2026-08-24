@@ -38,6 +38,12 @@ logger = logging.getLogger(__name__)
 
 TOKEN_RE = re.compile(r"tla:([0-9a-f]{12})")
 
+# HG-004 (hermaguard Phase 3): cap on entity-binding rows written per
+# request. Beyond blob_ids × kinds rows, a single overflow summary row
+# (entity_bound_overflow) replaces the cross-product so a hostile
+# request cannot fan the ledger out unboundedly.
+_BINDING_ROWS_PER_REQUEST_CAP = 64
+
 # Tools that must never receive a silent expansion by default. Pass-by-
 # reference moves content the model has not read, so it also bypasses any
 # human or filter that inspects model-emitted args; that is fine for content
@@ -504,19 +510,36 @@ def make_middleware(get_store, cfg: dict, skip_tools: frozenset):
             # blob_id) combination. Logged even when the destination
             # is later denied — the binding captures the action,
             # not its allow status.
+            # HG-004 (hermaguard Phase 3): the cross-product is capped
+            # per request; beyond the cap a single summary row with
+            # entity_kinds is written instead of one row per pair.
             if matches and blob_ids:
-                for bid in blob_ids:
-                    for kind in kinds:
-                        log_entity_binding(
-                            cfg, sid=session_id, tool=tool_name,
-                            entity_kind=kind, blob_id=bid,
-                            decision="entity_bound",
-                        )
+                pairs = len(blob_ids) * len(kinds)
+                if pairs > _BINDING_ROWS_PER_REQUEST_CAP:
+                    log_entity_binding(
+                        cfg, sid=session_id, tool=tool_name,
+                        entity_kinds=kinds,
+                        decision="entity_bound_overflow",
+                    )
+                else:
+                    for bid in blob_ids:
+                        for kind in kinds:
+                            log_entity_binding(
+                                cfg, sid=session_id, tool=tool_name,
+                                entity_kind=kind, blob_id=bid,
+                                decision="entity_bound",
+                            )
             # T3.3: ambiguity confirmation gate. Only fires when (a)
             # there is at least one token to expand AND (b) the args
             # span multiple distinct kinds. With confirmation_required
             # OFF (default) the gate is dormant and expansion proceeds
             # unchanged.
+            # HG-005 (hermaguard Phase 3): this gate is an audit and
+            # friction convention, NOT a security boundary. It keys on
+            # arg phrasing, so a caller can trivially stay under it by
+            # splitting one kind per request or inlining content. Real
+            # blocking would require content-level entity detection on
+            # the expanded payload — a deliberate Phase-4+ decision.
             if (blob_ids and len(kinds) > 1
                     and _confirmation_required(cfg)):
                 marker = _confirmation_marker(kinds)

@@ -47,12 +47,18 @@ def append_line(path, record: dict) -> bool:
     Returns True on success, False on any error. A write failure must
     not break the calling operation — expansion, fetch, etc. continue
     with the content they already had.
+
+    HG-004 (hermaguard Phase 3): before appending, the ledger is
+    size-checked and rotated at ``_LEDGER_ROTATE_BYTES`` into
+    ``<name>.jsonl.1`` (single previous generation). This bounds disk
+    growth on hot paths without unbounded read amplification.
     """
     try:
         p = Path(path)
         p.parent.mkdir(parents=True, exist_ok=True)
         # Tighten the directory on first touch; idempotent.
         _safe_chmod(p.parent, _DIR_MODE)
+        _rotate_if_large(p)
         line = json.dumps(record, sort_keys=True) + "\n"
         with open(p, "a", encoding="utf-8") as f:
             f.write(line)
@@ -61,6 +67,26 @@ def append_line(path, record: dict) -> bool:
     except Exception as exc:
         logger.warning("toolaria: ledger append %s failed: %s", path, exc)
         return False
+
+
+# HG-004: rotate a ledger when it exceeds this many bytes. The old
+# file moves to <name>.jsonl.1 (one generation kept), so worst case
+# on-disk is ~2x the cap.
+_LEDGER_ROTATE_BYTES = 16 * 1024 * 1024
+
+
+def _rotate_if_large(p: Path) -> None:
+    """Rotate *p* to ``p.with_suffix(p.suffix + '.1')`` when oversized."""
+    try:
+        if p.exists() and p.stat().st_size > _LEDGER_ROTATE_BYTES:
+            rotated = p.with_suffix(p.suffix + ".1")
+            if rotated.exists():
+                rotated.unlink()
+            p.rename(rotated)
+            logger.info("toolaria: rotated oversized ledger %s", p.name)
+    except OSError as exc:
+        logger.debug("toolaria: ledger rotation %s skipped: %s",
+                     p.name, exc)
 
 
 def log_entity_binding(cfg: dict, *, sid: str, tool: str,

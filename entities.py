@@ -17,7 +17,7 @@ Config (default empty ⇒ the whole feature is inert):
     entity_registry:
       - pattern_type: name          # or: regex
         pattern: "alice"            # literal name (case-insensitive) or a regex
-        kind: person                # free-form, drives the <kinds> marker
+        kind: person                # [a-z0-9_.-]{1,64}, drives the <kinds> marker
         sensitivity: personal       # one of labels.VALID_LABELS (default public)
 
 The registry is frozen + validated at register time; a malformed entry
@@ -25,6 +25,12 @@ raises ValueError so a broken config fails loud (same posture as the
 T2.1 sensitivity_tool_labels validator). When the registry is empty,
 ``extract_entities`` returns ``[]`` and the per-call hot path is a
 single O(1) list check — the feature stays byte-identical inert.
+
+Security bounds (hermaguard Phase 3): registry regexes are compiled
+through the timeout-honouring `regex` engine when available and every
+scan is bounded by string length, wall-clock budget, and recursion
+depth. Without the `regex` package, nested-quantifier patterns (the
+classic ReDoS shape) are rejected at validation.
 """
 from __future__ import annotations
 
