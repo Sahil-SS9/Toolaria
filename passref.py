@@ -36,7 +36,13 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
-TOKEN_RE = re.compile(r"tla:([0-9a-f]{12})")
+# T4.1: ``<bid>[@<int>]`` grammar. The optional version suffix
+# addresses a specific revision in the chain. Group 2 is the bare
+# 12-hex content id (used for the fetch call), group 3 is the
+# requested version.
+TOKEN_RE = re.compile(r"tla:([0-9a-f]{12})(@(\d+))?")
+# Backwards-compatible shorthand: when callers (or tests) expect the
+# bare 12-hex shape, ORed expansion below recovers both.
 
 # HG-004 (hermaguard Phase 3): cap on entity-binding rows written per
 # request. Beyond blob_ids × kinds rows, a single overflow summary row
@@ -119,6 +125,13 @@ CREDENTIAL_REFUSE_MARKER_SUFFIX = (
     " withheld; use range/grep slices or add destination to "
     "credential_destinations]"
 )
+
+# T4.1: version-refusal marker returned by passref expansion when a
+# ``tla:<bid>@<N>`` token references a version that does not exist in
+# the calling session's chain.
+VERSION_REFUSE_MARKER_PREFIX = "[Toolaria: version "
+VERSION_REFUSE_MARKER_MIDDLE = " not found for blob "
+VERSION_REFUSE_MARKER_SUFFIX = "]"
 
 
 def _parse_credential_destinations(raw) -> frozenset:
@@ -296,7 +309,10 @@ def _expand_string(text: str, store, cfg: dict, stats: dict,
         return text, False
     denied = _external_destination_denied(tool_name, cfg) if tool_name else False
     if denied:
-        stats["dest_denied"] = stats.get("dest_denied", 0) + len(TOKEN_RE.findall(text))
+        # len() of finditer: TOKEN_RE now has optional @N groups (T4.1),
+        # so findall would return tuples — the count is what matters.
+        stats["dest_denied"] = stats.get("dest_denied", 0) + sum(
+            1 for _ in TOKEN_RE.finditer(text))
 
     cap = int(cfg.get("passref_max_chars", 500000))
     total_cap = int(cfg.get("passref_total_max_chars", 2000000))
@@ -310,6 +326,44 @@ def _expand_string(text: str, store, cfg: dict, stats: dict,
                            dst_tool=tool_name, chars=0, decision="dest_denied")
             return _DEST_DENY_MARKER_PREFIX
         blob_id = m.group(1)
+        version_n = int(m.group(3) or 0)
+        # T4.1: resolve ``tla:<bid>@<N>`` to the chain-specific bid in
+        # the calling session's index. ``version_n == 0`` is the bare
+        # bid form (no @N) — that path is byte-identical to pre-T4.1.
+        idx: dict | None = None
+        if version_n > 0:
+            if session_id and store is not None:
+                resolved: str | None = None
+                try:
+                    idx = store._load_idx(session_id)
+                    resolved = store._resolve_version(
+                        idx, blob_id, version_n)
+                except Exception:
+                    resolved = None
+                blobs_idx: dict = idx.get("blobs", {}) if idx else {}
+                if not resolved or resolved not in blobs_idx:
+                    if stats.get("total", 0) >= total_cap:
+                        _log_expansion(cfg, sid=session_id, blob_id=blob_id,
+                                       dst_tool=tool_name, chars=0,
+                                       decision="budget_capped")
+                        return (f"[Toolaria: total expansion budget "
+                                f"{total_cap:,} chars exceeded]")
+                    _log_expansion(cfg, sid=session_id, blob_id=blob_id,
+                                   dst_tool=tool_name, chars=0,
+                                   decision="missing")
+                    stats["missing"] = stats.get("missing", 0) + 1
+                    return (f"{VERSION_REFUSE_MARKER_PREFIX}{version_n}"
+                            f"{VERSION_REFUSE_MARKER_MIDDLE}{blob_id}"
+                            f"{VERSION_REFUSE_MARKER_SUFFIX}")
+                blob_id = resolved
+            else:
+                # Either no session scoped (empty-session fallback)
+                # or no store at all: treat unknown @N the same way as
+                # the rest of passref treats an unwalkable chain.
+                stats["missing"] = stats.get("missing", 0) + 1
+                return (f"{VERSION_REFUSE_MARKER_PREFIX}{version_n}"
+                        f"{VERSION_REFUSE_MARKER_MIDDLE}{blob_id}"
+                        f"{VERSION_REFUSE_MARKER_SUFFIX}")
         if stats.get("total", 0) >= total_cap:
             _log_expansion(cfg, sid=session_id, blob_id=blob_id,
                            dst_tool=tool_name, chars=0,
@@ -417,7 +471,12 @@ def _blob_ids_in_args(args) -> list[str]:
 
     def _walk(v) -> None:
         if isinstance(v, str):
-            for bid in TOKEN_RE.findall(v):
+            # TOKEN_RE now carries the optional @N version groups
+            # (T4.1); findall returns tuples, so take group 1 — the
+            # bare 12-hex content id, which is what binding rows and
+            # expansion have always keyed on.
+            for m in TOKEN_RE.finditer(v):
+                bid = m.group(1)
                 if bid not in seen:
                     seen.add(bid)
                     found.append(bid)

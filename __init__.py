@@ -552,10 +552,16 @@ def _fetch(args: dict | None = None, **kwargs) -> str:
     if mode == "audit":
         return _store._audit_summary(count)
 
-    if not _BLOB_ID_RE.match(bid):
-        return f"Error: invalid blob id '{bid}' (expected 12 hex chars)"
+    bid_raw = args.get("id", "")
+    # T4.1: accept the ``<bid>[@<int>]`` grammar. The store's fetch
+    # layer parses it; a malformed ref is rejected there too, so we
+    # only check the bid half here to keep the legacy "12 hex chars"
+    # error wording for callers that do not pass a ref at all.
+    bid_only = bid_raw.split("@", 1)[0] if bid_raw else ""
+    if not _BLOB_ID_RE.match(bid_only):
+        return f"Error: invalid blob id '{bid_raw}' (expected 12 hex chars)"
 
-    return _store.fetch(bid, mode, start=start, count=count,
+    return _store.fetch(bid_raw, mode, start=start, count=count,
                         pattern=pattern, query=query, session_id=session_id)
 
 

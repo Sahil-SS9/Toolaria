@@ -50,6 +50,16 @@ except ImportError:
 _LABEL_SENSITIVITY = {"public": 0, "internal": 1, "personal": 2,
                        "credential": 3}
 _SLICE_MASK_MARKER = "[masked:credential-shape]"
+# T4.1: version-ref grammar — a blob ref is the 12-hex content id, optionally
+# followed by ``@N`` for a specific version in the chain. The fetch handler
+# parses this before the 12-hex validation, so older callers that pass a bare
+# bid remain byte-identical.
+_BLOB_REF_RE = re.compile(r"^([0-9a-f]{12})(?:@(\d+))?$")
+# Refusal marker returned by fetch when @N does not exist in the chain. The
+# exact shape is part of the T4.1 contract (tests pin the literal prefix).
+VERSION_NOT_FOUND_MARKER_PREFIX = "[Toolaria: version "
+VERSION_NOT_FOUND_MARKER_MIDDLE = " not found for blob "
+VERSION_NOT_FOUND_MARKER_SUFFIX = "]"
 # Over-fetch headroom for masked grep/chain: raw output is gathered at 4x
 # cap so post-mask re-capping still fills the budget. (Correctness agent:
 # named once — the two call sites must not drift.)
@@ -484,6 +494,79 @@ class BlobStore:
 
     # ── blob i/o ──────────────────────────
 
+    def _version_chain_head(self, idx: dict, tool_name: str) -> dict | None:
+        """Return the live chain head for *tool_name* in *idx*, or None.
+
+        The chain is per (tool, session) — successive puts from the same
+        tool in the same session form a version chain. This helper picks
+        the current head by scanning entries; O(N) but N is bounded by
+        typical session size and the scan only runs inside the write
+        lock, never on the fetch hot path.
+
+        The returned dict is the live entry itself; callers may mutate
+        it (under the blobstore lock) to advance the chain pointers.
+        """
+        blobs = idx.get("blobs") or {}
+        head: dict | None = None
+        for meta in blobs.values():
+            if not isinstance(meta, dict):
+                continue
+            if meta.get("tool") != tool_name:
+                continue
+            if "swept_at" in meta:
+                continue
+            v = meta.get("version", 1)
+            if v >= 1 and "superseded_by" not in meta:
+                if head is None or v > head.get("version", 0):
+                    head = meta
+        return head
+
+    def _resolve_version(self, idx: dict, blob_id: str,
+                          requested_version: int) -> str | None:
+        """Walk the chain in *idx* to find the bid whose ``version``
+        equals *requested_version*, starting from any blob with bid
+        == blob_id (or any chain that contains blob_id). Returns the
+        resolved bid or ``None`` if not found.
+        """
+        meta = (idx.get("blobs") or {}).get(blob_id)
+        if not isinstance(meta, dict):
+            return None
+        # Walk forward to the head, then back to the requested version.
+        node = meta
+        # Defensive bound: chains are short in practice.
+        for _ in range(1024):
+            nxt = node.get("superseded_by")
+            if not nxt:
+                break
+            nxt_meta = (idx.get("blobs") or {}).get(nxt)
+            if not isinstance(nxt_meta, dict):
+                break
+            node = nxt_meta
+        head = node
+        if head.get("version") == requested_version:
+            # Find the bid pointing at head.
+            for cb, cm in (idx.get("blobs") or {}).items():
+                if cm is head:
+                    return cb
+            return None
+        # Walk backward via supersedes.
+        cur = head
+        for _ in range(1024):
+            n = cur.get("version", 0)
+            if n == requested_version:
+                for cb, cm in (idx.get("blobs") or {}).items():
+                    if cm is cur:
+                        return cb
+                return None
+            prev = cur.get("supersedes")
+            if not prev:
+                return None
+            prev_meta = (idx.get("blobs") or {}).get(prev)
+            if not isinstance(prev_meta, dict):
+                return None
+            cur = prev_meta
+        return None
+
     def put(self, content: str, tool_name: str = "", session_id: str = "",
             args=None, label=None) -> str:
         """Store content, return short blob_id (first 12 hex of SHA256).
@@ -584,7 +667,49 @@ class BlobStore:
                 if self._label_rank(candidate) == final_rank:
                     final_label = candidate
                     break
-            idx["blobs"][bid] = {
+            # T4.1: version chain (per (tool, session)).
+            #
+            #  - If there's an existing live head for this (tool,
+            #    session) and its content-hash equals our new bid, the
+            #    content is unchanged → dedup. Same id, same version,
+            #    no new entry.
+            #
+            #  - If the head exists with a DIFFERENT content-hash, this
+            #    put is a new revision. We mark the head superseded_by
+            #    our bid, stamp the new entry with version = head+1 and
+            #    supersedes = head.bid.
+            #
+            #  - Independent (tool, session) groups keep their own
+            #    independent chains.
+            head_bid: str | None = None
+            for cb, cm in idx["blobs"].items():
+                if not isinstance(cm, dict):
+                    continue
+                if cm.get("tool") != tool_name:
+                    continue
+                if "swept_at" in cm:
+                    continue
+                if "superseded_by" in cm:
+                    continue
+                cb_version = cm.get("version", 1)
+                head_bid_version = (
+                    idx["blobs"][head_bid].get("version", 1)
+                    if head_bid in idx["blobs"] else 0
+                )
+                if head_bid is None or cb_version > head_bid_version:
+                    head_bid = cb
+            head_entry = idx["blobs"][head_bid] if head_bid else None
+            if head_entry is not None and head_entry.get("hash") == bhash:
+                # Dedup: refresh the timestamp on the existing head and
+                # return its bid. We do NOT add a new entry, so the
+                # version chain stays at the head's version with no
+                # new pointer churn.
+                head_entry["t"] = time.time()
+                self._save_idx(idx, sid)
+                return bid
+
+            # Build the new entry with version + (optional) supersedes.
+            new_entry: dict = {
                 "t": time.time(),
                 "tool": tool_name,
                 "size": len(raw),
@@ -602,6 +727,14 @@ class BlobStore:
                 # alongside label (T3.1 / D3).
                 "entity_kinds": _compute_entity_kinds(args, self.cfg),
             }
+            if head_entry is not None and head_bid is not None:
+                new_entry["version"] = head_entry.get("version", 1) + 1
+                new_entry["supersedes"] = head_bid
+                head_entry["superseded_by"] = bid
+            else:
+                new_entry["version"] = 1
+
+            idx["blobs"][bid] = new_entry
             # FIX-2: credential-slice cumulative-chars counter (resets on
             # sweep). Seed only to make the field visible to audit
             # tooling; _charge_slice_budget's .get default handles absence.
@@ -836,8 +969,25 @@ class BlobStore:
     def fetch(self, blob_id: str, mode: str, start=0, count=20,
               pattern=None, query=None, session_id: str = ""):
         """Retrieve a slice of a blob.
-        Modes: outline, search, range, grep, stat, full."""
-        if not _BLOB_ID_RE.match(blob_id):
+        Modes: outline, search, range, grep, stat, full.
+
+        ``blob_id`` (T4.1) may carry an optional ``@N`` version
+        suffix that addresses a specific version in the chain. ``@N``
+        is resolved by walking forward to the head and then backward
+        via ``supersedes`` until version N is found. A bare bid (no
+        @N) is unchanged from pre-T4.1 behaviour — every existing
+        call site stays byte-identical when @N is omitted.
+        """
+        # T4.1: parse the optional ``@N`` suffix. The 12-hex + optional
+        # version grammar is rejected up-front so a malformed ref
+        # returns a deterministic error rather than a 12-char bid the
+        # chain resolver would not recognise.
+        ref_match = _BLOB_REF_RE.match(blob_id or "")
+        version_requested = 0
+        if ref_match:
+            blob_id = ref_match.group(1)
+            version_requested = int(ref_match.group(2) or 0)
+        elif not _BLOB_ID_RE.match(blob_id or ""):
             return f"Error: invalid blob id '{blob_id}' (expected 12 hex chars)"
 
         cap = self.cfg.get("fetch_max_chars", 4000)
@@ -858,6 +1008,34 @@ class BlobStore:
             if tomb:
                 return tomb
             return f"Error: blob {blob_id} not found (may have been swept)"
+
+        # T4.1: version resolution. Walk the chain in the calling
+        # session's index to find the bid whose ``version`` equals
+        # the requested N. Session-scoping (above) ensures we only
+        # consult the calling session's chain.
+        if version_requested > 0 and session_id:
+            idx = self._load_idx(session_id)
+            resolved = self._resolve_version(idx, blob_id, version_requested)
+            if resolved and resolved in idx.get("blobs", {}):
+                # Re-point the locals so the rest of the function
+                # serves the resolved version's content. (The on-disk
+                # blob path is identical — versions share bytes keyed
+                # by content hash.)
+                blob_id = resolved
+                bpath = self.blob_dir / blob_id
+                # Re-validate file presence (defensive sweep race).
+                if not bpath.exists():
+                    tomb = self._tombstone_msg(blob_id, session_id)
+                    if tomb:
+                        return tomb
+                    return f"Error: blob {blob_id} not found (may have been swept)"
+            else:
+                return (
+                    f"{VERSION_NOT_FOUND_MARKER_PREFIX}"
+                    f"{version_requested}"
+                    f"{VERSION_NOT_FOUND_MARKER_MIDDLE}"
+                    f"{blob_id}{VERSION_NOT_FOUND_MARKER_SUFFIX}"
+                )
 
         # T2.3 + Phase 3 FIX-1 + FIX-3 + gate ordering (Phase 3 MEDIUM):
         # the credential gate runs BEFORE _refresh_blob so a refused
@@ -1700,6 +1878,14 @@ class BlobStore:
                             # lived in the tombstoned blob.
                             "entity_kinds": list(
                                 meta.get("entity_kinds", []) or []),
+                            # T4.1: preserve version-chain metadata so
+                            # superseded versions stay auditable as
+                            # tombstones (version number + the head
+                            # they were superseded by, if any).
+                            **({"version": meta["version"]}
+                               if "version" in meta else {}),
+                            **({"supersedes": meta["supersedes"]}
+                               if "supersedes" in meta else {}),
                         }
                         changed = True
                 elif now - meta.get("swept_at", 0) > tomb_ttl:
