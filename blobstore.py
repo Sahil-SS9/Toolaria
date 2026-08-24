@@ -32,8 +32,8 @@ except ImportError:
 # Sensitivity ordering for content-aware label resolution (FIX-1). The
 # highest index in this tuple wins when comparing two labels; this is the
 # single source of truth for "credential > personal > internal > public"
-# comparisons in BlobStore (and is mirrored in passref for fail-closed
-# label lookup).
+# comparisons in BlobStore. passref consumes it via
+# BlobStore._max_label_for_blob (fail-closed lookup), not its own copy.
 _LABEL_SENSITIVITY = {"public": 0, "internal": 1, "personal": 2,
                        "credential": 3}
 _SLICE_MASK_MARKER = "[masked:credential-shape]"
