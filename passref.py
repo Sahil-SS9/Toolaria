@@ -152,33 +152,53 @@ def _credential_destinations_allow(cfg: dict) -> frozenset:
 
 
 def _credential_enforcement_active(cfg: dict) -> bool:
-    """True iff enforcement_enabled is on AND the allowlist is configured.
+    """Phase 3 MEDIUM: explicit truthy semantics.
 
-    With enforcement off (the default), credential blobs flow through
-    the regular path — exactly like a public blob. The audit script
-    still emits per-row labels so operators can see credential flow in
-    flight while enforcement is off.
-    """
-    return bool(cfg.get("enforcement_enabled", False))
+    Note: this function only checks ``enforcement_enabled`` — it does
+    NOT check the allowlist. An empty allowlist + enforcement on is a
+    deny-all (every credential expansion refused), which is the safe
+    default. ``_credential_destinations_allow`` is the per-destination
+    check.
+
+    Phase 3 MEDIUM: explicit truthy semantics (not bare bool()) so a
+    YAML-quoted ``"false"`` actually disables the gate."""
+    from blobstore import BlobStore
+    return BlobStore._truthy(cfg.get("enforcement_enabled", False))
 
 
 def _find_label(store, blob_id: str, session_id: str) -> str:
-    """Best-effort label lookup for a blob.
+    """Phase 3 FIX-1 + FIX-3: content-aware label lookup, fail-closed
+    under enforcement_enabled=True.
 
-    Returns ``"public"`` on any error (missing index, no meta, no
-    label field) so a fresh-install or pre-T2.1 record never crashes
-    the expansion path. The audit script can still flag label-less
-    rows in its summary.
+    The label is a property of the *content* (blob_id = SHA256 prefix).
+    We resolve the highest sensitivity label present across every
+    session index that holds the blob, not just the calling session's
+    entry — so a credential blob that was re-rescued as public in
+    another session still resolves to ``credential`` here.
+
+    FAIL-CLOSED (FIX-3): when ``enforcement_enabled`` is True, an
+    unresolved label (None / missing everywhere / I/O error) is
+    treated as ``credential`` — never ``public``. Under enforcement
+    OFF the audit-friendly default of ``public`` is kept so the audit
+    script can run cleanly against mixed-version stores.
+
+    The audit script can still flag label-less rows in its summary
+    when enforcement is OFF (the fail-open case for mixed stores).
     """
     if store is None:
         return "public"
+    enforcement_on = _credential_enforcement_active(
+        getattr(store, "cfg", {}) or {})
     try:
-        meta = store._find_meta(blob_id, session_id)
-        if not meta:
-            return "public"
-        return meta.get("label") or "public"
+        # FIX-1: use the content-aware max-label scan so a credential
+        # blob downgraded in another session still resolves correctly.
+        max_label = store._max_label_for_blob(blob_id)
     except Exception:
-        return "public"
+        max_label = None
+    if max_label is None:
+        # FIX-3: under enforcement ON, fail-closed.
+        return "credential" if enforcement_on else "public"
+    return max_label
 
 
 def build_destination_deny_set(cfg: dict) -> frozenset:
