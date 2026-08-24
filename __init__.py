@@ -160,6 +160,16 @@ def _merge_cfg(user_cfg: dict) -> dict:
     # sees the typo before any rescue runs.
     from labels import _parse_tool_label_map
     _parse_tool_label_map(defaults.get("sensitivity_tool_labels"))
+    # T3.1: validate the entity_registry the same way so a broken
+    # pattern/regex/sensitivity never silently disables the governor
+    # or leaks into a half-broken put().
+    try:
+        from entities import parse_entity_registry
+        parse_entity_registry(defaults.get("entity_registry"))
+    except ImportError:
+        # entities.py missing on this checkout (e.g. running an older
+        # snapshot). Skip — the feature stays inert.
+        pass
     return defaults
 
 

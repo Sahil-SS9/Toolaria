@@ -22,9 +22,12 @@ try:
     from .index import render_outline as _render_outline
     from .chunking import chunk_lines as _chunk_lines
     from . import semantic as _sem
-    from .labels import (label_for_tool, label_for_args as _label_for_args,
-                          VALID_LABELS, _LABEL_UPGRADE_PATTERNS,
-                          _BUILTIN_TOOL_LABELS)
+    from labels import (label_for_tool, label_for_args as _label_for_args,
+                              VALID_LABELS, _LABEL_UPGRADE_PATTERNS,
+                              _BUILTIN_TOOL_LABELS)
+    from entities import (get_registry as _entity_registry,
+                              extract_entities as _extract_entities,
+                              distinct_entity_kinds as _distinct_entity_kinds)
 except ImportError:
     from excerpt import detect_type as _detect_type  # type: ignore[no-redef]
     from index import build_outline as _struct_outline  # type: ignore[no-redef]
@@ -34,6 +37,9 @@ except ImportError:
     from labels import (label_for_tool, label_for_args as _label_for_args,  # type: ignore[no-redef]
                          VALID_LABELS, _LABEL_UPGRADE_PATTERNS,  # type: ignore[no-redef]
                          _BUILTIN_TOOL_LABELS)  # type: ignore[no-redef]
+    from entities import (get_registry as _entity_registry,  # type: ignore[no-redef]
+                            extract_entities as _extract_entities,  # type: ignore[no-redef]
+                            distinct_entity_kinds as _distinct_entity_kinds)  # type: ignore[no-redef]
 
 
 # Sensitivity ordering for content-aware label resolution (FIX-1). The
@@ -58,6 +64,41 @@ _SLICE_BUDGET_MARKER_SUFFIX = (
     "; use allowlisted destinations]"
 )
 _CREDENTIAL_SLICE_BUDGET_DEFAULT = 2000
+
+
+# ── T3.1: entity_kinds resolver ────────────────────────────────────────────
+
+
+def _compute_entity_kinds(args, cfg) -> list[str]:
+    """Return the sorted distinct entity kinds referenced by *args*.
+
+    Best-effort: a broken entity_registry (e.g. an uncompilable regex
+    that survived validation) yields an empty list with a logged
+    warning rather than crashing the rescue path. The
+    ``entity_registry`` itself is validated at register time (FIX-4
+    posture), so under normal operation this is O(args size).
+    """
+    if not cfg:
+        return []
+    try:
+        registry = _entity_registry(cfg)
+    except Exception as exc:
+        logger.warning(
+            "toolaria: entity_registry resolve failed: %s; "
+            "falling back to empty entity_kinds", exc,
+        )
+        return []
+    if not registry:
+        return []
+    try:
+        matches = _extract_entities(args, registry)
+    except Exception as exc:
+        logger.warning(
+            "toolaria: extract_entities failed: %s; "
+            "falling back to empty entity_kinds", exc,
+        )
+        return []
+    return _distinct_entity_kinds(matches)
 
 
 # ── Phase 1 helpers (T1.3 redaction, T1.4 integrity marker) ─────────────
@@ -553,6 +594,13 @@ class BlobStore:
                 # tombstones (D3) so the audit script can report flow
                 # even after sweeps.
                 "label": final_label,
+                # T3.1: entity kinds referenced by the blob's args.
+                # Sorted list (JSON-safe) of distinct kinds; empty
+                # list when entity_registry is empty so the field is
+                # always present and the audit script never crashes on
+                # a missing key. Both sweep paths preserve this field
+                # alongside label (T3.1 / D3).
+                "entity_kinds": _compute_entity_kinds(args, self.cfg),
             }
             # FIX-2: credential-slice cumulative-chars counter (resets on
             # sweep). Seed only to make the field visible to audit
@@ -1565,6 +1613,12 @@ class BlobStore:
                             # tombstone so the audit script can still
                             # attribute historical flow after sweep.
                             "label": meta.get("label", "public"),
+                            # T3.1: also carry the entity_kinds set
+                            # across the TTL sweep so the audit script
+                            # reports what kinds of entity references
+                            # lived in the tombstoned blob.
+                            "entity_kinds": list(
+                                meta.get("entity_kinds", []) or []),
                         }
                         changed = True
                 elif now - meta.get("swept_at", 0) > tomb_ttl:
@@ -1631,6 +1685,10 @@ class BlobStore:
                     # sweep path too (different code path from TTL —
                     # both must keep the label).
                     "label": entry.get("label", "public"),
+                    # T3.1: also carry the entity_kinds set across the
+                    # size-cap sweep (same D3 rationale as label).
+                    "entity_kinds": list(
+                        entry.get("entity_kinds", []) or []),
                 }
                 self._write_idx_file(ip, idx)
 
