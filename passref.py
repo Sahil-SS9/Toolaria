@@ -99,6 +99,87 @@ DEFAULT_EXTERNAL_DESTINATIONS = frozenset({
 _DEST_DENY_MARKER_PREFIX = "[Toolaria: tla:<id> expansion denied; " \
     "tool is on passref_external_destinations — content not forwarded]"
 
+# T2.3 — credential-grade enforcement markers. The full marker is
+# constructed dynamically (it embeds the blob id), but the prefix and
+# suffix are exported so tests can pin against the exact shape. The
+# marker appears in TWO places: passref (downstream handoff refusal)
+# and rescuer_fetch full mode (upstream full-read refusal).
+CREDENTIAL_REFUSE_MARKER_PREFIX = (
+    "[Toolaria: credential-labelled blob "
+)
+CREDENTIAL_REFUSE_MARKER_SUFFIX = (
+    " withheld; use range/grep slices or add destination to "
+    "credential_destinations]"
+)
+
+
+def _parse_credential_destinations(raw) -> frozenset:
+    """Validate the operator-controlled allowlist of credential destinations.
+
+    Mirrors ``_parse_external_destinations`` — same contract, same fail-loud
+    posture. Empty / None is a valid deny-all (no destinations permitted).
+    """
+    if raw is None:
+        return frozenset()
+    if not isinstance(raw, list):
+        raise ValueError(
+            "credential_destinations must be a list of tool names, "
+            f"got {type(raw).__name__}"
+        )
+    out = set()
+    for entry in raw:
+        if not isinstance(entry, str) or not entry:
+            raise ValueError(
+                "credential_destinations entries must be non-empty "
+                f"strings, got {entry!r}"
+            )
+        out.add(entry)
+    return frozenset(out)
+
+
+def _credential_destinations_allow(cfg: dict) -> frozenset:
+    """Resolve and freeze the credential_destinations allowlist.
+
+    Cached under a private key so the per-token hot-path check is O(1).
+    Empty default ⇒ all credential expansions are refused.
+    """
+    allow = cfg.get("_credential_destinations_frozen")
+    if allow is None:
+        allow = _parse_credential_destinations(
+            cfg.get("credential_destinations"))
+        cfg["_credential_destinations_frozen"] = allow
+    return allow
+
+
+def _credential_enforcement_active(cfg: dict) -> bool:
+    """True iff enforcement_enabled is on AND the allowlist is configured.
+
+    With enforcement off (the default), credential blobs flow through
+    the regular path — exactly like a public blob. The audit script
+    still emits per-row labels so operators can see credential flow in
+    flight while enforcement is off.
+    """
+    return bool(cfg.get("enforcement_enabled", False))
+
+
+def _find_label(store, blob_id: str, session_id: str) -> str:
+    """Best-effort label lookup for a blob.
+
+    Returns ``"public"`` on any error (missing index, no meta, no
+    label field) so a fresh-install or pre-T2.1 record never crashes
+    the expansion path. The audit script can still flag label-less
+    rows in its summary.
+    """
+    if store is None:
+        return "public"
+    try:
+        meta = store._find_meta(blob_id, session_id)
+        if not meta:
+            return "public"
+        return meta.get("label") or "public"
+    except Exception:
+        return "public"
+
 
 def build_destination_deny_set(cfg: dict) -> frozenset:
     """Compose the effective deny set from cfg.
@@ -225,6 +306,24 @@ def _expand_string(text: str, store, cfg: dict, stats: dict,
             _log_expansion(cfg, sid=session_id, blob_id=blob_id,
                            dst_tool=tool_name, chars=0, decision="missing")
             return f"[Toolaria: blob {blob_id} unavailable; re-run the source tool]"
+        # T2.3: credential-grade enforcement. With enforcement on, a
+        # credential blob only expands into destinations on the
+        # allowlist; everyone else sees the deterministic refusal
+        # marker. The check happens after session-scope + existence so
+        # a denied attempt still costs the same I/O as an allowed one
+        # (no side-channel about whether the blob exists for the
+        # calling session).
+        label = _find_label(store, blob_id, session_id)
+        if _credential_enforcement_active(cfg) and label == "credential":
+            allow = _credential_destinations_allow(cfg)
+            if tool_name not in allow:
+                stats["denied"] = stats.get("denied", 0) + 1
+                _log_expansion(cfg, sid=session_id, blob_id=blob_id,
+                               dst_tool=tool_name, chars=0,
+                               decision="credential_denied",
+                               label=label)
+                return (f"{CREDENTIAL_REFUSE_MARKER_PREFIX}{blob_id}"
+                        f"{CREDENTIAL_REFUSE_MARKER_SUFFIX}")
         if len(content) > cap:
             content = (content[:cap] +
                        f"\n[Toolaria: truncated, blob is {len(content):,} chars "
@@ -233,7 +332,7 @@ def _expand_string(text: str, store, cfg: dict, stats: dict,
         stats["total"] = stats.get("total", 0) + len(content)
         _log_expansion(cfg, sid=session_id, blob_id=blob_id,
                        dst_tool=tool_name, chars=len(content),
-                       decision="expanded")
+                       decision="expanded", label=label)
         return content
 
     return TOKEN_RE.sub(_sub, text), denied

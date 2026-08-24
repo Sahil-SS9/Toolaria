@@ -64,10 +64,12 @@ def append_line(path, record: dict) -> bool:
 
 
 def log_expansion(cfg: dict, *, sid: str, blob_id: str, dst_tool: str,
-                  chars: int, decision: str) -> bool:
+                  chars: int, decision: str,
+                  label: str | None = None) -> bool:
     """Write one T1.5 expansion record and log it at INFO.
 
     decision ∈ expanded | dest_denied | session_denied | missing | budget_capped
+                 | credential_denied (T2.3)
 
     Returns True if the line was written. The INFO log fires only on
     successful append so a failing audit trail stays quiet rather than
@@ -81,11 +83,18 @@ def log_expansion(cfg: dict, *, sid: str, blob_id: str, dst_tool: str,
         "chars": chars,
         "decision": decision,
     }
+    # T2.2 / T2.3: per-row label. ``None`` is omitted so pre-T2.2 rows
+    # (no label field) still parse cleanly; the audit script falls back
+    # to index lookup for label-less rows.
+    if label is not None:
+        record["label"] = label
     path = ledger_path(cfg, "expansions")
     if append_line(path, record):
         logger.info(
-            "toolaria: expansion ledger blob=%s dst=%s chars=%d decision=%s",
+            "toolaria: expansion ledger blob=%s dst=%s chars=%d decision=%s"
+            "%s",
             blob_id, dst_tool, chars, decision,
+            f" label={label}" if label else "",
         )
         return True
     return False
