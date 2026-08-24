@@ -286,6 +286,39 @@ except ImportError:
     _regex_engine = None
     _HAVE_REGEX = False
 
+
+# T4.2: Fernet at-rest encryption (D8 — credential-tier only). The
+# `cryptography` package is an optional extra; the canonical test runner
+# installs it via ``uv run --with cryptography``. When absent we degrade
+# to plaintext (inert default — encryption is gated, not mandatory) and
+# log a single WARNING so an operator who configured a key file sees
+# why their data is still plaintext.
+try:
+    from cryptography.fernet import Fernet as _Fernet, InvalidToken as _FernetInvalidToken
+    _HAVE_FERNET = True
+except ImportError:
+    _Fernet = None  # type: ignore[assignment]
+    _FernetInvalidToken = Exception  # type: ignore[assignment, misc]
+    _HAVE_FERNET = False
+
+
+# T4.2: refusal marker returned when an encrypted blob's key is missing
+# or corrupt (or when Fernet refuses the ciphertext). The marker is the
+# ONLY string a read path may surface for an unreadable encrypted blob —
+# never partial plaintext, never a stack trace. Prefix/suffix are
+# exported so T4.4 audit + downstream tests can pin the literal shape.
+ENCRYPTION_FAIL_MARKER_PREFIX = "[Toolaria: encrypted blob "
+ENCRYPTION_FAIL_MARKER_SUFFIX = (
+    " cannot be decrypted (missing/corrupt key); content withheld]"
+)
+
+
+class _EncryptionUnavailable(Exception):
+    """Internal control-flow signal raised when an encrypted blob cannot
+    be decrypted (missing key file, corrupt key, or malformed
+    ciphertext). Read paths catch this and return
+    ``ENCRYPTION_FAIL_MARKER_PREFIX..SUFFIX``; never partial plaintext."""
+
 # Patterns containing any of these are "regex" rather than literal; refused on
 # the fallback path.
 _META_CHARS = set(r".^$*+?{}[]\|()")
@@ -353,6 +386,176 @@ class BlobStore:
         # the legacy dispatcher is in use without spamming every
         # charge with a WARNING line.
         self._empty_session_logged = False
+        # T4.2: cached Fernet instance, lazy-resolved from
+        # ``toolaria_key_file``. ``None`` ⇒ encryption is inactive
+        # (no key configured, library missing, or key invalid — the
+        # store treats any of these as inert plaintext). Rotation
+        # resets the cache so the new key is picked up on next
+        # encrypt / decrypt. A single instance per BlobStore keeps
+        # the hot path O(1) after the first credential put.
+        self._fernet = None
+        self._fernet_missing_logged = False
+
+    # ── T4.2 encryption helpers (Fernet at-rest, credential-only) ─────
+
+    def _encryption_active(self) -> bool:
+        """True iff ``toolaria_key_file`` is configured AND cryptography
+        is importable. The library check is one-shot — when absent
+        every credential put falls back to plaintext with a single
+        WARNING so the operator sees why their config did not
+        activate encryption.
+        """
+        if not _HAVE_FERNET:
+            if not self._fernet_missing_logged:
+                kf = self.cfg.get("toolaria_key_file")
+                if kf:
+                    logger.warning(
+                        "toolaria: cryptography.fernet unavailable; "
+                        "toolaria_key_file=%s configured but encryption "
+                        "is inert (install cryptography to enable). "
+                        "Warning emitted once per process.", kf,
+                    )
+                self._fernet_missing_logged = True
+            return False
+        return bool(self.cfg.get("toolaria_key_file"))
+
+    def _load_or_create_fernet(self):
+        """Return a cached Fernet, creating the key file at 0600 if missing.
+
+        Returns ``None`` when encryption is inactive (no key configured
+        OR cryptography missing). On a corrupt existing key file the
+        helper raises ``_EncryptionUnavailable`` so callers fail loud —
+        we never silently substitute a fresh key (that would orphan
+        every previously-encrypted blob).
+        """
+        if not self._encryption_active():
+            return None
+        if self._fernet is not None:
+            return self._fernet
+        kf = self.cfg["toolaria_key_file"]
+        kpath = Path(kf).expanduser()
+        try:
+            kpath.parent.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            logger.warning(
+                "toolaria: could not create key file dir %s: %s; "
+                "encryption stays inert for this process",
+                kpath.parent, exc,
+            )
+            return None
+        key_bytes: bytes | None = None
+        generated = False
+        if kpath.exists():
+            try:
+                key_bytes = kpath.read_bytes().strip()
+            except OSError as exc:
+                logger.warning(
+                    "toolaria: key file %s unreadable: %s",
+                    kpath, exc,
+                )
+                return None
+            try:
+                self._fernet = _Fernet(key_bytes)
+                return self._fernet
+            except (ValueError, Exception):
+                # Existing key file is corrupt — refuse rather than
+                # overwrite (overwriting would orphan every encrypted
+                # blob written under the previous key). Raise so the
+                # read path catches _EncryptionUnavailable and returns
+                # the deterministic marker.
+                logger.warning(
+                    "toolaria: key file %s exists but is not a valid "
+                    "Fernet key; refusing to overwrite. Reads of "
+                    "encrypted blobs will fail safe.",
+                    kpath,
+                )
+                raise _EncryptionUnavailable(
+                    f"corrupt key file: {kpath}")
+        # Generate a fresh key.
+        key_bytes = _Fernet.generate_key()
+        generated = True
+        try:
+            kpath.write_bytes(key_bytes)
+            _chmod_safe(kpath, _FILE_MODE)
+        except OSError as exc:
+            logger.warning(
+                "toolaria: could not write key file %s: %s; encryption "
+                "stays inert for this process", kpath, exc,
+            )
+            return None
+        logger.warning(
+            "toolaria: generated new Fernet key at %s (0600). "
+            "This is a one-time bootstrap — subsequent runs reuse the "
+            "file. Backup the key file: losing it makes every encrypted "
+            "credential blob unreadable.",
+            kpath,
+        )
+        self._fernet = _Fernet(key_bytes)
+        return self._fernet
+
+    def _blob_encrypted(self, blob_id: str) -> bool:
+        """True iff any session's index entry for *blob_id* carries
+        ``enc: True``.
+
+        Index-driven (not disk-driven) so a missing/corrupt key file
+        cannot produce a false positive — the entry field is the
+        authoritative source of truth for which on-disk bytes are
+        ciphertext vs plaintext.
+        """
+        for ip in sorted(self.meta_dir.glob("*.json")):
+            entry = self._read_idx_file(ip).get("blobs", {}).get(blob_id)
+            if isinstance(entry, dict) and entry.get("enc") is True:
+                return True
+        return False
+
+    def _encrypt_bytes(self, plain: bytes) -> bytes | None:
+        """Fernet-encrypt *plain* using the cached key. Returns ``None``
+        when encryption is inactive (caller falls back to plaintext
+        write with a single WARNING). Raises ``_EncryptionUnavailable``
+        when the key is missing or corrupt — the put path catches that
+        and refuses the write rather than partial-encrypting.
+        """
+        f = self._load_or_create_fernet()
+        if f is None:
+            return None
+        return f.encrypt(plain)
+
+    def _decrypt_bytes(self, blob_id: str, cipher: bytes) -> bytes:
+        """Fernet-decrypt *cipher* for *blob_id*. Raises
+        ``_EncryptionUnavailable`` on any failure (missing key file,
+        corrupt key, malformed ciphertext, library mismatch). The
+        caller is responsible for translating the exception into the
+        deterministic refusal marker — this helper never returns
+        partial plaintext.
+        """
+        # Resolve the Fernet without auto-creating a key file: on a
+        # read path we want a missing key to fail safe, not bootstrap
+        # a brand-new key that would orphan every existing encrypted
+        # blob.
+        if not _HAVE_FERNET:
+            raise _EncryptionUnavailable("cryptography.fernet unavailable")
+        if self._fernet is None:
+            kf = self.cfg.get("toolaria_key_file")
+            if not kf:
+                raise _EncryptionUnavailable("no toolaria_key_file")
+            kpath = Path(kf).expanduser()
+            if not kpath.exists():
+                raise _EncryptionUnavailable(f"key file missing: {kpath}")
+            try:
+                key_bytes = kpath.read_bytes().strip()
+            except OSError as exc:
+                raise _EncryptionUnavailable(
+                    f"key file unreadable: {exc}") from exc
+            try:
+                self._fernet = _Fernet(key_bytes)
+            except (ValueError, Exception) as exc:
+                raise _EncryptionUnavailable(
+                    f"key file invalid: {exc}") from exc
+        try:
+            return self._fernet.decrypt(cipher)
+        except (_FernetInvalidToken, ValueError, Exception) as exc:
+            raise _EncryptionUnavailable(
+                f"Fernet decrypt failed for {blob_id}: {exc}") from exc
 
     # ── sidecars (per-blob index/vector artefacts) ──
 
@@ -396,13 +599,32 @@ class BlobStore:
                 pass
 
     def blob_text(self, blob_id: str) -> str | None:
-        """Decoded blob content, or None if missing or binary."""
+        """Decoded blob content, or None if missing or binary.
+
+        T4.2: when the entry carries ``enc: True`` the on-disk bytes are
+        Fernet ciphertext and this call decrypts them transparently.
+        On key failure (missing / corrupt key) the marker string
+        ``ENCRYPTION_FAIL_MARKER_PREFIX..SUFFIX`` is returned instead of
+        None so the caller (passref expansion) surfaces an honest
+        refusal rather than a generic 'unavailable' line. Partial
+        plaintext is never returned.
+        """
         bpath = self.blob_dir / blob_id
         if not bpath.exists():
             return None
         try:
-            return bpath.read_bytes().decode("utf-8")
-        except (UnicodeDecodeError, OSError):
+            data = bpath.read_bytes()
+        except OSError:
+            return None
+        if self._blob_encrypted(blob_id):
+            try:
+                data = self._decrypt_bytes(blob_id, data)
+            except _EncryptionUnavailable:
+                return (f"{ENCRYPTION_FAIL_MARKER_PREFIX}{blob_id}"
+                        f"{ENCRYPTION_FAIL_MARKER_SUFFIX}")
+        try:
+            return data.decode("utf-8")
+        except UnicodeDecodeError:
             return None
 
     def build_outline(self, blob_id: str, text: str) -> dict:
@@ -645,28 +867,85 @@ class BlobStore:
                 resolved = "public"
         label = resolved
         with _LOCK:
+            # T4.2: encryption decision is made AFTER the cross-session
+            # label scan resolves the content-owned ``final_label``
+            # (below). Ciphertext lives on disk under the same
+            # content-hash path (bid = SHA256 prefix of PLAINTEXT) so
+            # the existing dedup check still recognises an unchanged
+            # head by its plaintext hash.
             if not bpath.exists():
-                bpath.write_bytes(raw)
+                # Tentative: defer the actual write until final_label is
+                # resolved. The first occurrence of the blob under this
+                # (tool, session) always writes; a re-write of an
+                # already-on-disk blob reuses the existing file (no
+                # encryption toggle on dedup — content is the same so
+                # the same plaintext, hence the same ciphertext under
+                # the same key).
+                idx = self._load_idx(sid)
+                idx.setdefault("blobs", {})
+                existing = idx["blobs"].get(bid, {})
+                # FIX-1 upgrade-only: never overwrite a higher existing
+                # label in THIS session's index with a lower one.
+                # Cross-session max is computed below via the per-blob
+                # scan.
+                new_rank = self._label_rank(label)
+                existing_rank = self._label_rank(existing.get("label"))
+                # Cross-session max label (FIX-1): if any other session
+                # holds a higher label for the same blob_id, the new
+                # entry must carry that max so this session's lookup
+                # also sees it.
+                cross_max = self._max_label_for_blob(bid)
+                cross_rank = self._label_rank(cross_max)
+                final_rank = max(new_rank, existing_rank, cross_rank)
+                final_label = label
+                for candidate in (existing.get("label"), cross_max):
+                    if self._label_rank(candidate) == final_rank:
+                        final_label = candidate
+                        break
+                # Now decide encryption based on the resolved label.
+                encrypt_for_put = (
+                    final_label == "credential"
+                    and self._encryption_active())
+                disk_bytes: bytes = raw
+                enc_marker: bool = False
+                if encrypt_for_put:
+                    try:
+                        cipher = self._encrypt_bytes(raw)
+                    except _EncryptionUnavailable as exc:
+                        logger.warning(
+                            "toolaria: T4.2 key unavailable for put "
+                            "(%s); refusing to write credential blob %s "
+                            "under plaintext — caller will see the "
+                            "fail-safe marker", exc, bid,
+                        )
+                        raise
+                    if cipher is not None:
+                        disk_bytes = cipher
+                        enc_marker = True
+                bpath.write_bytes(disk_bytes)
                 _chmod_safe(bpath, _FILE_MODE)
-            idx = self._load_idx(sid)
-            idx.setdefault("blobs", {})
-            existing = idx["blobs"].get(bid, {})
-            # FIX-1 upgrade-only: never overwrite a higher existing label
-            # in THIS session's index with a lower one. Cross-session max
-            # is computed below via the per-blob scan.
-            new_rank = self._label_rank(label)
-            existing_rank = self._label_rank(existing.get("label"))
-            # Cross-session max label (FIX-1): if any other session holds
-            # a higher label for the same blob_id, the new entry must
-            # carry that max so this session's lookup also sees it.
-            cross_max = self._max_label_for_blob(bid)
-            cross_rank = self._label_rank(cross_max)
-            final_rank = max(new_rank, existing_rank, cross_rank)
-            final_label = label
-            for candidate in (existing.get("label"), cross_max):
-                if self._label_rank(candidate) == final_rank:
-                    final_label = candidate
-                    break
+            else:
+                idx = self._load_idx(sid)
+                idx.setdefault("blobs", {})
+                existing = idx["blobs"].get(bid, {})
+                new_rank = self._label_rank(label)
+                existing_rank = self._label_rank(existing.get("label"))
+                cross_max = self._max_label_for_blob(bid)
+                cross_rank = self._label_rank(cross_max)
+                final_rank = max(new_rank, existing_rank, cross_rank)
+                final_label = label
+                for candidate in (existing.get("label"), cross_max):
+                    if self._label_rank(candidate) == final_rank:
+                        final_label = candidate
+                        break
+                # Blob file already exists from a prior put. The on-disk
+                # bytes (plaintext vs ciphertext) are fixed by the
+                # FIRST write — content-addressing means we never
+                # re-write the same bid with a different encoding, so
+                # any existing entry's ``enc`` field is the authoritative
+                # source. Surface it here so the new entry stays in sync
+                # with the file.
+                enc_marker = bool(existing.get("enc", False))
             # T4.1: version chain (per (tool, session)).
             #
             #  - If there's an existing live head for this (tool,
@@ -719,6 +998,14 @@ class BlobStore:
                 # tombstones (D3) so the audit script can report flow
                 # even after sweeps.
                 "label": final_label,
+                # T4.2: ``enc`` is the authoritative marker for at-rest
+                # ciphertext. Set on the entry at the same time the
+                # ciphertext bytes are written to disk; the read path
+                # keys off this field (never the on-disk prefix, which
+                # is identical for plaintext and ciphertext because
+                # both are addressed by the PLAINTEXT hash — that's
+                # the design that lets dedup continue to work).
+                "enc": enc_marker,
                 # T3.1: entity kinds referenced by the blob's args.
                 # Sorted list (JSON-safe) of distinct kinds; empty
                 # list when entity_registry is empty so the field is
@@ -1078,6 +1365,19 @@ class BlobStore:
             # Swept by a concurrent sweep between the existence check and read.
             return (self._tombstone_msg(blob_id, session_id)
                     or f"Error: blob {blob_id} not found (may have been swept)")
+        # T4.2: decrypt BEFORE integrity verification. The on-disk
+        # bytes may be Fernet ciphertext (when the entry carries
+        # ``enc: True``); the stored ``hash`` field is the SHA256 of
+        # PLAINTEXT, so integrity must compare against the decrypted
+        # bytes. A missing/corrupt key raises _EncryptionUnavailable
+        # which we translate to the deterministic refusal marker —
+        # never partial plaintext, never a bare exception.
+        if self._blob_encrypted(blob_id):
+            try:
+                raw = self._decrypt_bytes(blob_id, raw)
+            except _EncryptionUnavailable:
+                return (f"{ENCRYPTION_FAIL_MARKER_PREFIX}{blob_id}"
+                        f"{ENCRYPTION_FAIL_MARKER_SUFFIX}")
         # T1.4: integrity verification. Full SHA256 over the on-disk bytes
         # compared with the index-recorded hash. A mismatch returns an
         # exact deterministic marker and logs at WARNING. The verification
@@ -1872,6 +2172,12 @@ class BlobStore:
                             # tombstone so the audit script can still
                             # attribute historical flow after sweep.
                             "label": meta.get("label", "public"),
+                            # T4.2: preserve the encryption marker so
+                            # the T4.4 audit can report historical
+                            # encryption coverage (D3-style: tombstones
+                            # must NOT drop custom fields).
+                            **({"enc": True}
+                               if meta.get("enc") is True else {}),
                             # T3.1: also carry the entity_kinds set
                             # across the TTL sweep so the audit script
                             # reports what kinds of entity references
@@ -1952,6 +2258,10 @@ class BlobStore:
                     # sweep path too (different code path from TTL —
                     # both must keep the label).
                     "label": entry.get("label", "public"),
+                    # T4.2: preserve the encryption marker across the
+                    # size-cap sweep too (matches the TTL path above).
+                    **({"enc": True}
+                       if entry.get("enc") is True else {}),
                     # T3.1: also carry the entity_kinds set across the
                     # size-cap sweep (same D3 rationale as label).
                     "entity_kinds": list(

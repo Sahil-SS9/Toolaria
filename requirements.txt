@@ -9,3 +9,12 @@ regex>=2024.0.0
 #   sentence-transformers  enables semantic search mode
 #   numpy                  speeds up the vector maths (pure-Python fallback otherwise)
 # Install with: pip install sentence-transformers numpy
+#
+# T4.2 — Fernet at-rest encryption (D8 — credential tier only).
+#   cryptography        enables Fernet encrypt/decrypt of credential blobs;
+#                       optional so a fresh install carries no new mandatory
+#                       runtime deps. With a key file configured but the
+#                       library missing, encryption is inert (WARNING emitted
+#                       once per process) and the store degrades to plaintext.
+# Install with: pip install cryptography
+
