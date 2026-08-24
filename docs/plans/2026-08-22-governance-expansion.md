@@ -110,9 +110,10 @@ Phase 0 — Hardening
 - [x] T0.3 `passref_external_destinations` deny list — commit d9c4459
 - [x] T0.4 Fail-loud middleware fallback + conditional `tla:` handle text — commit eaa7c5a
 - [x] T0.5 Chain mode in schema/docs + ARCHITECTURE.md drift fix — commit 658c246
-- [~] P0 exit: suite green ✅, perms verified ✅, functional probe ✅ — 48h dogfood PENDING (cron f5ad03c493cb, due 2026-08-24 ~12:15 BST)
+- [~] P0 exit: suite green ✅, perms verified ✅, functional probe ✅ — 48h dogfood PASSED (cron f5ad03c493cb, 2026-08-24 12:15 BST)
 
 > **Authorisation note (2026-08-22, Sahil):** Phase 1 BUILD may proceed immediately on current evidence; DEPLOYMENT of Phase 1 remains gated on the Phase 0 cron PASS. Sunday output verifies the approach and forces amendments if needed.
+> **Deployment note (2026-08-24):** Phase 0 gate PASS → Phase 1 files synced to live plugin dir; Sahil restarted gateway manually at ~15:31 BST after in-session restart was blocked by the anti-respawn guard. **Phase 1 LIVE — verified:** args_snapshot fields appearing in live indexes, zero errors, Phase 0 gate still PASS.
 
 Phase 1 — Instrumentation
 - [x] T1.1 Timestamp-proxy reacquisition metrics + report script — commit 163f07b
