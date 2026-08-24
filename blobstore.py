@@ -15,12 +15,14 @@ try:
     from .index import render_outline as _render_outline
     from .chunking import chunk_lines as _chunk_lines
     from . import semantic as _sem
+    from .labels import label_for_tool, label_for_args as _label_for_args
 except ImportError:
     from excerpt import detect_type as _detect_type  # type: ignore[no-redef]
     from index import build_outline as _struct_outline  # type: ignore[no-redef]
     from index import render_outline as _render_outline  # type: ignore[no-redef]
     from chunking import chunk_lines as _chunk_lines  # type: ignore[no-redef]
     import semantic as _sem  # type: ignore[no-redef]
+    from labels import label_for_tool, label_for_args as _label_for_args  # type: ignore[no-redef]
 
 
 # ── Phase 1 helpers (T1.3 redaction, T1.4 integrity marker) ─────────────
@@ -329,7 +331,7 @@ class BlobStore:
     # ── blob i/o ──────────────────────────
 
     def put(self, content: str, tool_name: str = "", session_id: str = "",
-            args=None) -> str:
+            args=None, label: str | None = None) -> str:
         """Store content, return short blob_id (first 12 hex of SHA256).
 
         *session_id* is the owning session; callers must pass it so the
@@ -341,7 +343,14 @@ class BlobStore:
         produced a blob. The content hash is unaffected — redaction only
         touches metadata. ``args_snapshot_max_chars`` caps the snapshot
         length; pass ``args_snapshot_max_chars=0`` to disable capture
-        even when args is provided (benchmark-only escape hatch)."""
+        even when args is provided (benchmark-only escape hatch).
+
+        *label* (T2.1/T2.4) is an explicit sensitivity label override.
+        When None, the label is resolved from the tool name +
+        args-shape. When provided, it bypasses the tool/args heuristic
+        and is stored verbatim. Useful for callers that have already
+        classified (e.g. the host dispatch layer consulting
+        ``label_for_args`` before the rescue fires)."""
         if isinstance(content, str):
             raw = content.encode("utf-8")
         else:
@@ -357,6 +366,23 @@ class BlobStore:
             args_snapshot = None
         else:
             args_snapshot = _redact_args_snapshot(args, max_chars)
+        # T2.1: resolve sensitivity label. Explicit > tool-map >
+        # args-shape. label_for_args never downgrades, so passing an
+        # operator-configured "personal" through the args heuristic still
+        # yields "personal" (or "credential" if args look secret-shaped).
+        if label is None:
+            tool_label = label_for_tool(tool_name, self.cfg)
+            label = _label_for_args(args, tool_label, self.cfg)
+        else:
+            # Explicit label still respects args-shape upgrade — but only
+            # if the caller hasn't already gone to the ceiling. A "public"
+            # explicit that gets credential-shaped args becomes
+            # credential; "credential" stays credential. Downgrade is
+            # never implied by an explicit (operator-set) label.
+            tool_label = label_for_tool(tool_name, self.cfg)
+            label = _label_for_args(args, label, self.cfg) \
+                if label != "credential" else label
+            _ = tool_label  # used implicitly via label_for_args above
         with _LOCK:
             if not bpath.exists():
                 bpath.write_bytes(raw)
@@ -369,6 +395,10 @@ class BlobStore:
                 "size": len(raw),
                 "hash": bhash,
                 "args_snapshot": args_snapshot,
+                # T2.1: persist label alongside other metadata. Kept on
+                # tombstones (D3) so the audit script can report flow
+                # even after sweeps.
+                "label": label,
             }
             self._save_idx(idx, sid)
         return bid
@@ -538,6 +568,18 @@ class BlobStore:
 
         # Touch the blob so an actively-used result does not expire mid-task.
         self._refresh_blob(blob_id, session_id)
+
+        # T2.3: enforcement ON + credential label → full reads are refused
+        # with the exact deterministic marker; slices (range/grep/search/
+        # outline/stat) stay available. Gate sits after session scoping and
+        # before any byte read, so no code path returns full content.
+        if (self._enforcement_enabled() and mode == "full"):
+            meta = self._find_meta(blob_id, session_id) or {}
+            if meta.get("label") == "credential":
+                from passref import (CREDENTIAL_REFUSE_MARKER_PREFIX,
+                                     CREDENTIAL_REFUSE_MARKER_SUFFIX)
+                return (f"{CREDENTIAL_REFUSE_MARKER_PREFIX}{blob_id}"
+                        f"{CREDENTIAL_REFUSE_MARKER_SUFFIX}")
 
         try:
             if mode == "stat":
@@ -771,6 +813,55 @@ class BlobStore:
     def _is_live(entry: dict) -> bool:
         return "swept_at" not in entry
 
+    def _enforcement_enabled(self) -> bool:
+        """T2.3: master switch for credential-grade enforcement."""
+        return bool(self.cfg.get("enforcement_enabled", False))
+
+    def _audit_summary(self, count: int = 20) -> str:
+        """T2.2: read-only last-N expansion ledger summary for /rescuer audit.
+
+        Reads the JSONL expansion ledger directly — no blob bytes are
+        touched and no fetch counters move. Degrades to a friendly line
+        when the ledger is absent or empty.
+        """
+        ledger = self.meta_dir.parent / "ledger" / "expansions.jsonl"
+        if not ledger.exists():
+            return ("Toolaria audit: no data yet "
+                    "(no expansions recorded; ledger file not present).")
+        rows: list[dict] = []
+        try:
+            with open(ledger, "r", encoding="utf-8") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        rows.append(json.loads(line))
+                    except json.JSONDecodeError:
+                        continue  # skip malformed lines, keep summarising
+        except OSError:
+            return "Toolaria audit: ledger unreadable (I/O error)."
+        if not rows:
+            return "Toolaria audit: ledger present but empty."
+        by_dst: dict[str, dict] = {}
+        for row in rows[-count:]:
+            dst = row.get("dst_tool", "?")
+            slot = by_dst.setdefault(
+                dst, {"expanded": 0, "denied": 0, "chars": 0})
+            if row.get("decision") == "expanded":
+                slot["expanded"] += 1
+                slot["chars"] += row.get("chars", 0) or 0
+            else:
+                slot["denied"] += 1
+        lines = [f"Toolaria audit (last {min(count, len(rows))} events):"]
+        for dst, slot in sorted(by_dst.items(),
+                                key=lambda kv: -kv[1]["expanded"]):
+            lines.append(
+                f"  {dst}: expanded={slot['expanded']} "
+                f"denied={slot['denied']} chars={slot['chars']:,}")
+        return "\n".join(lines)
+
+
     def _sweep_by_ttl(self, now, ttl, tomb_ttl):
         # For each session: expire live entries past their effective TTL into
         # tombstones, and drop tombstones past the tombstone TTL.
@@ -803,11 +894,24 @@ class BlobStore:
                     else:
                         weighted = 0.0
                     effective_ttl = hot_ttl if weighted >= threshold else ttl
+                    # T2.3: credential-labelled blobs have a hard 24h TTL
+                    # that overrides hot-pinning — an actively-fetched
+                    # credential must still age out on schedule.
+                    if (self._enforcement_enabled()
+                            and meta.get("label") == "credential"):
+                        effective_ttl = min(
+                            effective_ttl,
+                            self.cfg.get("credential_ttl_hours", 24) * 3600,
+                        )
                     if now - meta.get("t", 0) > effective_ttl:
                         blobs[bid] = {
                             "swept_at": now,
                             "tool": meta.get("tool", ""),
                             "size": meta.get("size", 0),
+                            # T2.1 / D3: carry the label into the
+                            # tombstone so the audit script can still
+                            # attribute historical flow after sweep.
+                            "label": meta.get("label", "public"),
                         }
                         changed = True
                 elif now - meta.get("swept_at", 0) > tomb_ttl:
@@ -870,6 +974,10 @@ class BlobStore:
                     "swept_at": now,
                     "tool": entry.get("tool", ""),
                     "size": entry.get("size", 0),
+                    # T2.1 / D3: preserve the label across the size-cap
+                    # sweep path too (different code path from TTL —
+                    # both must keep the label).
+                    "label": entry.get("label", "public"),
                 }
                 self._write_idx_file(ip, idx)
 

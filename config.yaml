@@ -66,3 +66,7 @@ toolaria:
   sequence_capture: false           # T1.2: write {ts,sid,blob_id} to store_path/sequences/events.jsonl on every fetch
   args_snapshot_max_chars: 2000     # T1.3: cap on the per-blob redacted args snapshot stored in the session index
   verify_integrity: true            # T1.4: SHA256-compare blob bytes against the index hash on every fetch; refuse + log mismatch
+  # Phase 2 — Data governance (T2.1)
+  # Sensitivity labels. Operator override on top of the built-in
+  # defaults (mail→personal, web→public). See labels.py.
+  sensitivity_tool_labels: {}       # T2.1: {tool_name: label} overrides the built-in tool→label map

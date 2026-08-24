@@ -147,6 +147,8 @@ def _merge_cfg(user_cfg: dict) -> dict:
     defaults.update(user_cfg)
     for _k, _v in _PHASE1_DEFAULTS.items():
         defaults.setdefault(_k, _v)
+    for _k, _v in _PHASE2_DEFAULTS.items():
+        defaults.setdefault(_k, _v)
     return defaults
 
 
@@ -156,6 +158,14 @@ _PHASE1_DEFAULTS: dict = {
     "sequence_capture": False,      # T1.2: default OFF ⇒ zero sidecar writes
     "args_snapshot_max_chars": 2000,  # T1.3: cap on the per-blob redacted args snapshot
     "verify_integrity": True,        # T1.4: default ON; benchmarks opt out via cfg
+}
+
+# Phase 2 data-governance defaults (T2.1/T2.3). These are the hard
+# floor that keeps the cfg consistent even when PyYAML is unavailable
+# to parse config.yaml. The YAML file remains the operator-facing knob;
+# code-level defaults here are the safe-on-every-install defaults.
+_PHASE2_DEFAULTS: dict = {
+    "sensitivity_tool_labels": {},  # T2.1: built-ins cover the common cases
 }
 
 
@@ -230,8 +240,10 @@ def register(ctx) -> None:
                     "mode": {
                         "type": "string",
                         "enum": ["outline", "search", "range", "grep",
-                                 "chain", "stat", "full"],
-                        "description": "Retrieval mode (default: stat)",
+                                 "chain", "stat", "full", "audit"],
+                        "description": ("Retrieval mode (default: stat). "
+                                        "'audit' returns the read-only "
+                                        "expansion ledger summary."),
                     },
                     "start": {
                         "type": "integer",
@@ -502,6 +514,14 @@ def _fetch(args: dict | None = None, **kwargs) -> str:
     pattern = args.get("pattern", "")
     query = args.get("query", "")
     session_id = kwargs.get("session_id", "")
+
+    # T2.2: audit mode is a status query, not a blob retrieval. It
+    # reads the expansion ledger directly (no blob bytes touched, no
+    # fetch_count bumped). The blob id is accepted but unused, so a
+    # operator can call audit with any well-formed handle from a recent
+    # rescue without re-running the rescue.
+    if mode == "audit":
+        return _store._audit_summary(count)
 
     if not _BLOB_ID_RE.match(bid):
         return f"Error: invalid blob id '{bid}' (expected 12 hex chars)"
