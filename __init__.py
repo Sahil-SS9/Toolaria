@@ -142,13 +142,24 @@ def _merge_cfg(user_cfg: dict) -> dict:
     code so the cfg carries them even when PyYAML is unavailable to parse
     config.yaml. The YAML file remains the operator-facing knob; the
     code-level defaults are the hard floor that keeps the suite passing
-    on the canonical test runner (``uv run --with pytest --with regex``)."""
+    on the canonical test runner (``uv run --with pytest --with regex``).
+
+    Phase 3 FIX-4: validate ``sensitivity_tool_labels`` here so a bad
+    operator config (typo in a label name, list instead of dict, etc.)
+    fails LOUD at register time — the plugin refuses to come up
+    rather than silently disabling rescue later."""
     defaults = _load_defaults()
     defaults.update(user_cfg)
     for _k, _v in _PHASE1_DEFAULTS.items():
         defaults.setdefault(_k, _v)
     for _k, _v in _PHASE2_DEFAULTS.items():
         defaults.setdefault(_k, _v)
+    # Phase 3 FIX-4: surface operator typos at startup. The validator
+    # raises ValueError listing offending keys/values; we let that
+    # bubble up to register() and abort plugin load so the operator
+    # sees the typo before any rescue runs.
+    from labels import _parse_tool_label_map as _parse_labels
+    _parse_labels(defaults.get("sensitivity_tool_labels"))
     return defaults
 
 
@@ -180,6 +191,14 @@ def register(ctx) -> None:
     _cfg["exclude_tools"] = excludes
     try:
         _store = BlobStore(_cfg)
+        # Phase 3 FIX-1 / FIX-3: backfill labels on every existing
+        # index entry before the first sweep. Wrapped best-effort so a
+        # single broken entry cannot break register() (the comment
+        # on backfill_labels() documents the same posture).
+        try:
+            _store.backfill_labels()
+        except Exception as e:
+            logger.warning("toolaria: label backfill failed: %s", e)
         _store.lazy_sweep()
     except Exception as e:
         logger.warning("toolaria: blob store init failed, rescuing disabled: %s", e)
