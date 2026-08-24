@@ -121,6 +121,134 @@ def build_entity_binding_summary(rows: list[dict]) -> dict:
     }
 
 
+# ── T4.4 encryption coverage (Fernet-at-rest counters) ──────────────────
+
+
+def build_encryption_coverage(entries: dict) -> dict:
+    """T4.4: tally credential blobs by at-rest encryption state.
+
+    Counts come from index entries (live + tombstones) so historical
+    coverage survives sweep. Every label=='credential' blob is
+    classified as either encrypted (entry carries ``enc: True``) or
+    plaintext (the inert default). Public / personal / internal blobs
+    are tallied under ``public`` for context (they're never
+    encrypted at rest under the T4.2 contract, but the audit report
+    surfaces the totals so an operator can sanity-check the
+    classifier).
+
+    Returns a dict with three integer counters. The renderer omits
+    the section when ``encrypted + plaintext_credential + public ==
+    0`` so a pre-T4.2 store produces a clean report.
+    """
+    encrypted = 0
+    plaintext_credential = 0
+    public = 0
+    for meta in entries.values():
+        if not isinstance(meta, dict):
+            continue
+        label = meta.get("label", "public")
+        if label == "credential":
+            if meta.get("enc") is True:
+                encrypted += 1
+            else:
+                plaintext_credential += 1
+        else:
+            public += 1
+    return {
+        "encrypted": encrypted,
+        "plaintext_credential": plaintext_credential,
+        "public": public,
+    }
+
+
+# ── T4.4 version-chain stats (T4.1) ────────────────────────────────────────
+
+
+def build_version_chain_stats(entries: dict) -> dict:
+    """T4.4: compute max chain depth + superseded count from index
+    entries.
+
+    A "chain" is the set of entries sharing a (tool, session) group
+    linked by ``supersedes`` / ``superseded_by`` pointers. The
+    ``max_depth`` is the longest chain anywhere in the store;
+    ``superseded_count`` is the number of entries that are NOT the
+    head of their chain (i.e. have a successor).
+
+    Both fields are always present; callers may treat depth=1
+    superseded_count=0 as "no chains".
+
+    Parameters
+    ----------
+    entries : dict[(safe_sid, bid) -> meta]
+        The session-index entries dict produced by ``load_sessions``.
+        Grouping by (safe_sid, tool) approximates the (tool, session)
+        chain boundary since entries from different sessions are
+        bucketed under different ``safe_sid`` values.
+    """
+    # Group entries by (safe_sid, tool). Within each group, walk the
+    # supersedes/supereded_by graph to find the head of each chain,
+    # then count its length.
+    groups: dict[tuple[str, str], dict[str, dict]] = {}
+    for (safe_sid, bid), meta in entries.items():
+        if not isinstance(meta, dict):
+            continue
+        tool = meta.get("tool", "")
+        groups.setdefault((safe_sid, tool), {})[bid] = meta
+
+    max_depth = 1  # a single-entry chain is depth 1
+    superseded_count = 0
+    for group in groups.values():
+        # Build a successor map: bid -> bid whose ``supersedes`` points
+        # at the key. Walks forward from a head to its successor even
+        # when the predecessor doesn't carry ``superseded_by`` (which
+        # is the shape that survives serialization through older
+        # indexes and through test fixtures built without the
+        # backward-pointer).
+        successor: dict[str, str] = {}
+        for bid, meta in group.items():
+            if not isinstance(meta, dict):
+                continue
+            prev = meta.get("supersedes")
+            if prev and prev in group:
+                successor[prev] = bid
+
+        # Heads: entries that do NOT supersede anything else. These are
+        # either singletons (no predecessor nor successor) or the
+        # oldest link of a chain.
+        heads = [bid for bid, meta in group.items()
+                 if isinstance(meta, dict) and "supersedes" not in meta]
+        seen: set[str] = set()
+        for head_bid in heads:
+            if head_bid in seen:
+                continue
+            depth = 0
+            cur = head_bid
+            for _ in range(1024):  # defensive upper bound on chain length
+                if cur in seen:
+                    break
+                meta = group.get(cur)
+                if meta is None:
+                    break
+                seen.add(cur)
+                depth += 1
+                nxt = successor.get(cur)
+                if not nxt:
+                    break
+                cur = nxt
+            if depth > max_depth:
+                max_depth = depth
+        # Count superseded: every entry that supersedes a predecessor
+        # is a non-head chain link (the head has no ``supersedes``).
+        for meta in group.values():
+            if isinstance(meta, dict) and "supersedes" in meta:
+                superseded_count += 1
+
+    return {
+        "max_depth": max_depth,
+        "superseded_count": superseded_count,
+    }
+
+
 # ── Stats ─────────────────────────────────────────────────────────────────
 
 
@@ -219,6 +347,16 @@ def build_report(store_path) -> dict:
         # so downstream renderers can branch on total == 0 cleanly.
         "entity_bindings": build_entity_binding_summary(
             load_entity_bindings(store_path)),
+        # T4.4: encryption-coverage counters derived from index
+        # entries. Three integers — encrypted, plaintext_credential,
+        # public. The renderer omits the section when ALL three are
+        # zero so a pre-T4.2 store produces a clean report.
+        "encryption_coverage": build_encryption_coverage(entries),
+        # T4.4: version-chain stats (T4.1). max_depth is the longest
+        # chain anywhere; superseded_count is the number of non-head
+        # entries (every chain link except the head). Always present;
+        # a single-entry chain yields max_depth=1 superseded_count=0.
+        "version_chain_stats": build_version_chain_stats(entries),
     }
 
 
@@ -281,6 +419,34 @@ def render(report: dict) -> str:
             )
             for tool, count in by_tool:
                 lines.append(f"      top ambiguous: {tool} ({count})")
+    # T4.4: encryption-coverage section. Omitted when no credential
+    # blobs at all (encrypted + plaintext_credential == 0) so a
+    # pre-T4.2 / plaintext-only store does not gain a noisy header.
+    # The public counter is included when non-zero so an operator
+    # can sanity-check the classifier without flipping between two
+    # reports.
+    enc = report.get("encryption_coverage") or {}
+    enc_n = int(enc.get("encrypted", 0))
+    plc_n = int(enc.get("plaintext_credential", 0))
+    pub_n = int(enc.get("public", 0))
+    if enc_n or plc_n:
+        lines.append("  encryption coverage (T4.4):")
+        lines.append(
+            f"    credential blobs at rest: encrypted={enc_n} "
+            f"plaintext={plc_n}"
+        )
+        if pub_n:
+            lines.append(f"    non-credential blobs: {pub_n}")
+    # T4.4: version-chain stats (T4.1). Omitted when nothing
+    # superseded (single-entry chains are not interesting).
+    vcs = report.get("version_chain_stats") or {}
+    superseded_n = int(vcs.get("superseded_count", 0))
+    if superseded_n > 0:
+        lines.append("  version chains (T4.1 audit surface):")
+        lines.append(
+            f"    max chain depth: {vcs.get('max_depth', 1)}  "
+            f"superseded versions: {superseded_n}"
+        )
     return "\n".join(lines)
 
 
