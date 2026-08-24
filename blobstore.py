@@ -922,7 +922,20 @@ class BlobStore:
         lines that are credential-shaped are returned as the mask
         marker instead of the raw text, but the line-number prefix and
         the body layout are preserved so paging still works. Returns
-        (output, served_chars)."""
+        (output, served_chars).
+
+        RISKY-1 (Phase 4): _grep_safe truncates each matched line body
+        to 500 chars before the post-filter runs. A credential shape
+        that appears past position 500 of a long line was therefore
+        NOT visible to the mask check, so the truncated 500-char body
+        leaked unmasked under enforcement ON. Range mode (which scans
+        ``line[:_MASK_LINE_SCAN_LEN]``) masked the same line. The fix:
+        after parsing the line-number ``n`` from a grep output line,
+        run the upgrade-pattern check against the ORIGINAL full line
+        ``lines[int(n)][:_MASK_LINE_SCAN_LEN]`` instead of the
+        truncated body. Output shape / line-number prefixes are
+        unchanged for non-matching lines.
+        """
         if not mask_lines:
             return self._grep_safe(lines, pattern, cap), 0
         # Run grep with a generous cap so we can post-filter without
@@ -931,11 +944,26 @@ class BlobStore:
                               cap * _MASK_OVERFETCH_FACTOR)
         out_lines: list = []
         for ln in raw.splitlines():
-            if ": " in ln and ln.split(": ", 1)[0].isdigit():
-                n, body = ln.split(": ", 1)
-                if any(p.search(body[:_MASK_LINE_SCAN_LEN])
-                       for p in _LABEL_UPGRADE_PATTERNS):
-                    out_lines.append(f"{n}: {_SLICE_MASK_MARKER}")
+            # Lines with the "{n}: {body}" shape are match lines.
+            # Header/footer lines (timeouts, no-match, 50-match cap)
+            # lack that shape and pass through verbatim.
+            head, sep, body = ln.partition(": ")
+            if sep and head.isdigit():
+                # RISKY-1: check the ORIGINAL full line up to the
+                # mask scan window, not the truncated body that
+                # _grep_safe already capped at 500 chars.
+                idx = int(head)
+                if 0 <= idx < len(lines):
+                    original = lines[idx]
+                else:
+                    # Defensive: an out-of-range n (shouldn't happen)
+                    # falls back to the truncated body so we never
+                    # raise from the mask pass.
+                    original = body
+                scan = (original[:_MASK_LINE_SCAN_LEN]
+                        if isinstance(original, str) else "")
+                if any(p.search(scan) for p in _LABEL_UPGRADE_PATTERNS):
+                    out_lines.append(f"{head}: {_SLICE_MASK_MARKER}")
                     continue
             out_lines.append(ln)
         out = "\n".join(out_lines)
