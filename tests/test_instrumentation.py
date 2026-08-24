@@ -569,11 +569,17 @@ class TestExpansionLedger:
         mw(tool_name="t", args={"x": f"tla:{bid}"})
         rows = _read_ledger(Path(toolaria._store.cfg["store_path"]))
         for r in rows:
-            assert set(r) == {"ts", "sid", "blob_id", "dst_tool", "chars",
-                              "decision"}, f"unexpected keys: {set(r)}"
+            # Required schema fields. ``label`` (T2.2) is OPTIONAL — it
+            # appears on rows written after the Phase 2 cut-over; older
+            # rows or label-less ledger rows must still parse cleanly.
+            required = {"ts", "sid", "blob_id", "dst_tool", "chars",
+                         "decision"}
+            assert required <= set(r), (
+                f"missing required keys; have {set(r)!r}"
+            )
             assert r["decision"] in {
                 "expanded", "dest_denied", "session_denied",
-                "missing", "budget_capped",
+                "missing", "budget_capped", "credential_denied",
             }
 
     def test_no_token_no_ledger_line(self, plugin, toolaria):
