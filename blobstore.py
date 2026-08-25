@@ -959,12 +959,19 @@ class BlobStore:
             except OSError:
                 pass
 
-    def delete_sidecars(self, blob_id: str) -> None:
+    def delete_sidecars(self, blob_id: str, *, strict: bool = False) -> None:
+        """Delete every cached sidecar for *blob_id*.
+
+        Normal sweep cleanup remains best-effort. Security-sensitive
+        plaintext→credential upgrades pass ``strict=True`` and abort before
+        encryption if any plaintext sidecar cannot be removed.
+        """
         for p in self.sidecar_dir.glob(f"{blob_id}.*.json"):
             try:
                 p.unlink()
             except OSError:
-                pass
+                if strict:
+                    raise
 
     def blob_text(self, blob_id: str) -> str | None:
         """Decoded blob content, or None if missing or binary.
@@ -1025,7 +1032,9 @@ class BlobStore:
                     or _looks_like_fernet(
                         (self.blob_dir / blob_id).read_bytes()))
         except OSError:
-            return False
+            # The caller holds plaintext and is deciding whether it is safe
+            # to cache it. Unknown disk state must suppress the write.
+            return True
 
     def _outline(self, blob_id: str, text: str) -> str:
         cached = self.read_sidecar(blob_id, "outline")
@@ -1365,6 +1374,12 @@ class BlobStore:
                         )
                         raise
                     if cipher is not None:
+                        # Remove plaintext-derived caches BEFORE replacing the
+                        # public blob with ciphertext. If cleanup fails, abort
+                        # while the blob is still consistently public/plaintext
+                        # rather than leave an encrypted blob beside a leaked
+                        # plaintext sidecar after a crash.
+                        self.delete_sidecars(bid, strict=True)
                         self._atomic_write_blob(bpath, cipher)
                         enc_marker = True
             # T4.1: version chain (per (tool, session)).

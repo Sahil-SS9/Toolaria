@@ -104,9 +104,26 @@ class TestRF1NoSidecarsForEncrypted:
         enc = mk_store(with_key=True, store_name="up")
         enc.put(content, "web_search", session_id="s2",
                 label="credential")
-        if enc._sidecars_forbidden(bid):
-            enc.delete_sidecars(bid)
         assert not list(enc.sidecar_dir.glob(f"{bid}*"))
+
+    def test_uncertain_disk_state_suppresses_sidecar_write(
+            self, mk_store, monkeypatch):
+        """An unreadable blob must fail closed: no plaintext cache write."""
+        store = mk_store()
+        bid = store.put("public data", "web_search", session_id="s",
+                        label="public")
+        monkeypatch.setattr(store, "_blob_encrypted", lambda _bid: False)
+        target = store.blob_dir / bid
+        path_type = type(target)
+        original_read_bytes = path_type.read_bytes
+
+        def unreadable(self):
+            if self == target:
+                raise PermissionError("simulated unreadable blob")
+            return original_read_bytes(self)
+
+        monkeypatch.setattr(path_type, "read_bytes", unreadable)
+        assert store._sidecars_forbidden(bid) is True
 
 
 class TestRF2UpgradeEncryptsInPlace:
@@ -198,9 +215,12 @@ class TestRF4DurableRotation:
         old_key.write_bytes(__import__(
             "cryptography.fernet", fromlist=["Fernet"]).Fernet
             .generate_key())
-        new_key = tmp_path / "new.key"
+        # The '#' proves the persisted value is YAML-quoted rather than
+        # interpreted as an inline comment.
+        new_key = tmp_path / "new # key.key"
         cfg_yaml.write_text(f"toolaria:\n"
                             f"  toolaria_key_file: {old_key}\n")
+        __import__("os").chmod(cfg_yaml, 0o600)
 
         real_expanduser = __import__("pathlib").Path.expanduser
 
@@ -213,6 +233,7 @@ class TestRF4DurableRotation:
 
         import pathlib
         monkeypatch.setattr(pathlib.Path, "expanduser", fake_expanduser)
+        monkeypatch.setenv("HERMES_HOME", str(hermes))
 
         cfg = dict(base_cfg)
         cfg["toolaria_key_file"] = str(old_key)
@@ -230,10 +251,44 @@ class TestRF4DurableRotation:
         assert str(new_key) in yaml_text, (
             "RF4: successful rotation did not durably update "
             "config.yaml — restart would break decryption")
+        import json
+        scalar = next(
+            line.split(":", 1)[1].strip()
+            for line in yaml_text.splitlines()
+            if line.strip().startswith("toolaria_key_file:")
+        )
+        assert json.loads(scalar) == str(new_key), (
+            "RF4: key path was not encoded as a safely quoted YAML scalar")
+        assert cfg_yaml.stat().st_mode & 0o777 == 0o600, (
+            "RF4: replacing config.yaml weakened its 0600 permissions")
         assert "sudo systemctl restart" in out, (
             "RF4: operator must be told to restart")
         fresh = BlobStore({**base_cfg, "toolaria_key_file": str(new_key)})
         assert fresh.blob_text(bid) == REAL_KEY
+
+    def test_rotation_failure_is_not_reported_as_partial_success(
+            self, toolaria, monkeypatch, tmp_path):
+        hermes = tmp_path / "hermes"
+        hermes.mkdir()
+        old_key = tmp_path / "old.key"
+        cfg_yaml = hermes / "config.yaml"
+        cfg_yaml.write_text(
+            f"toolaria:\n  toolaria_key_file: {old_key}\n")
+        monkeypatch.setenv("HERMES_HOME", str(hermes))
+
+        class BrokenStore:
+            store_path = str(tmp_path / "store")
+
+            @staticmethod
+            def rotate_key(_new_path):
+                raise RuntimeError("simulated pre-rotation failure")
+
+        monkeypatch.setattr(toolaria, "_store", BrokenStore())
+        monkeypatch.setattr(
+            toolaria, "_cfg", {"toolaria_key_file": str(old_key)})
+        out = toolaria._rotate_key_cmd(str(tmp_path / "new.key"))
+        assert out.startswith("Error: rotation failed"), out
+        assert "PARTIAL SUCCESS" not in out
 
 
 class TestRF5NegativeCacheNeverStale:

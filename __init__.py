@@ -326,26 +326,15 @@ def register(ctx) -> None:
 def _rotate_key_cmd(raw_args: str = "") -> str:
     """Operator command: durable, restart-safe key rotation.
 
-    Reviewer fix 4 (2026-08-25): rotate_key() alone mutates only the
-    in-process cfg — after a gateway restart config.yaml still named
-    the OLD key and every rotated blob failed to decrypt. This command
-    is the supported contract:
-
-      1. runs BlobStore.rotate_key (blobs + new key file on disk),
-      2. atomically rewrites ``toolaria_key_file`` in ~/.hermes/
-         config.yaml under a lockfile,
-      3. tells the operator to restart the gateway (one line).
-
-    Steps 1–2 are coordinated here so a successful command output
-    means BOTH blobs and durable config agree; the restart then picks
-    up the new path. If step 2 fails, rotation is rolled back is NOT
-    attempted automatically (blob rewrites already happened) — instead
-    the operator gets explicit recovery instructions.
+    Rotation and the durable config pointer are serialised under a real
+    cross-process lock. The replacement config is written at owner-only
+    permissions, flushed, fsynced and atomically installed without weakening
+    an existing stricter owner-only mode.
     """
     if not _store:
         return "Error: Toolaria store not initialised"
-    new_path = (raw_args or "").strip()
-    if not new_path:
+    requested = (raw_args or "").strip()
+    if not requested:
         return ("Usage: /toolaria-rotate-key <new-key-path>\n"
                 "The new key file must be OUTSIDE the store directory "
                 "and will be created at 0600 if missing.")
@@ -353,55 +342,114 @@ def _rotate_key_cmd(raw_args: str = "") -> str:
     if not old_cfg:
         return ("Error: no toolaria_key_file configured in config.yaml; "
                 "nothing to rotate. Set it first, then re-run.")
-    try:
-        count = _store.rotate_key(new_path)
-    except Exception as exc:
-        return (f"Error: rotation FAILED before any durable change was "
-                f"complete: {exc}\nNo config.yaml change was made.")
-    # Persist toolaria_key_file into ~/.hermes/config.yaml.
+
+    import json as _json
     import re as _re
-    cfg_path = Path("~/.hermes/config.yaml").expanduser()
+    import stat as _stat
+    import tempfile as _tempfile
+
+    new_path_p = Path(requested).expanduser().resolve()
+    store_path = Path(_store.store_path).expanduser().resolve()
+    if new_path_p == store_path or store_path in new_path_p.parents:
+        return ("Error: new key file must be outside the Toolaria store "
+                f"directory ({store_path})")
+    new_path = str(new_path_p)
+
+    hermes_home = Path(os.environ.get("HERMES_HOME", "~/.hermes")).expanduser()
+    cfg_path = hermes_home / "config.yaml"
+    if not cfg_path.is_file():
+        return (f"Error: durable Hermes config not found at {cfg_path}; "
+                "rotation was not started")
     lock_path = cfg_path.with_suffix(cfg_path.suffix + ".toolaria.lock")
+    lock_fd = None
+    tmp_name = None
+    encoded_path = _json.dumps(new_path)
+    rotation_completed = False
     try:
-        text = cfg_path.read_text() if cfg_path.exists() else ""
-        quoted = str(new_path)
+        lock_fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o600)
+        os.fchmod(lock_fd, 0o600)
+        try:
+            import fcntl as _fcntl
+            _fcntl.flock(lock_fd, _fcntl.LOCK_EX)
+        except ImportError:  # pragma: no cover - non-POSIX host
+            pass
+
+        # Preflight the exact durable pointer before touching blob bytes.
+        text = cfg_path.read_text()
         pattern = _re.compile(
-            r"^(\s*toolaria_key_file\s*:\s*).*$", _re.MULTILINE)
-        if pattern.search(text):
-            new_text = pattern.sub(
-                lambda m: m.group(1) + quoted, text)
-        else:
-            anchor = _re.search(r"^toolaria:", text, _re.MULTILINE)
-            addition = f"  toolaria_key_file: {quoted}\n"
-            if anchor:
-                insert_at = anchor.end()
-                new_text = (text[:insert_at] + "\n" + addition.strip("\n")
-                            + "\n" + text[insert_at:])
-            else:
-                new_text = (text.rstrip("\n")
-                            + ("\n" if text else "")
-                            + "toolaria:\n" + addition)
-        fd = os.open(str(lock_path), os.O_CREAT | os.O_WRONLY, 0o600)
-        with os.fdopen(fd, "w") as lf:
-            lf.write("locked")
-        tmp = cfg_path.with_suffix(cfg_path.suffix + ".tmp")
-        with open(tmp, "w") as f:
+            r"^(?P<prefix>[ \t]+toolaria_key_file[ \t]*:[ \t]*).*$",
+            _re.MULTILINE,
+        )
+        matches = list(pattern.finditer(text))
+        if len(matches) != 1 or str(old_cfg) not in matches[0].group(0):
+            return (
+                "Error: config.yaml does not contain exactly one matching "
+                "toolaria_key_file entry for the active old key; rotation "
+                "was not started"
+            )
+        # JSON strings are valid YAML scalars and safely preserve '#', ':',
+        # quotes, backslashes and whitespace in operator-supplied paths.
+        new_text = pattern.sub(
+            lambda m: m.group("prefix") + encoded_path, text, count=1)
+
+        count = _store.rotate_key(new_path)
+        rotation_completed = True
+
+        original_mode = _stat.S_IMODE(cfg_path.stat().st_mode)
+        target_mode = original_mode & 0o600
+        if target_mode == 0:
+            target_mode = 0o600
+        fd, tmp_name = _tempfile.mkstemp(
+            dir=cfg_path.parent,
+            prefix=f".{cfg_path.name}.",
+            suffix=".tmp",
+        )
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            os.fchmod(f.fileno(), target_mode)
             f.write(new_text)
-        os.replace(tmp, cfg_path)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_name, cfg_path)
+        tmp_name = None
+        os.chmod(cfg_path, target_mode)
+        # Persist the directory entry as well as the file contents.
+        dir_fd = os.open(str(cfg_path.parent), os.O_RDONLY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
+        _cfg["toolaria_key_file"] = new_path
     except Exception as exc:
+        if not rotation_completed:
+            return (
+                f"Error: rotation failed before completion: {exc}\n"
+                "No durable config change was made."
+            )
+        # rotate_key persists the new key before rewriting blobs. If config
+        # installation fails after a successful rotation, the new key remains
+        # recoverable and the exact durable pointer is reported.
         return (
             "PARTIAL SUCCESS — read carefully:\n"
-            f"  Blobs rotated: {count}. New key written: {new_path}\n"
-            f"  BUT config.yaml update FAILED: {exc}\n"
-            "Recovery: manually set 'toolaria_key_file' in "
-            "~/.hermes/config.yaml to the new path, then restart the "
-            "gateway. Do NOT delete the old key file until this is done."
+            f"  New key target: {new_path}\n"
+            f"  BUT durable config update FAILED: {exc}\n"
+            f"Recovery: set 'toolaria_key_file' in {cfg_path} to "
+            f"{encoded_path if 'encoded_path' in locals() else new_path!r}, "
+            "then restart the gateway. Do NOT delete either key file."
         )
     finally:
-        try:
-            lock_path.unlink()
-        except OSError:
-            pass
+        if tmp_name:
+            try:
+                os.unlink(tmp_name)
+            except OSError:
+                pass
+        if lock_fd is not None:
+            try:
+                import fcntl as _fcntl
+                _fcntl.flock(lock_fd, _fcntl.LOCK_UN)
+            except (ImportError, OSError):
+                pass
+            os.close(lock_fd)
+
     return (
         f"Key rotation complete.\n"
         f"  blobs re-encrypted: {count}\n"
