@@ -72,6 +72,21 @@
 
 ### Phase 3 — Pre-execution entity governor
 
+> **SCOPE RESOLUTION (2026-08-25, Sahil-approved Option A):** the work
+> shipped under "Phase 3" is NOT this phase. What was built and audited
+> is a **passref-scoped entity binding + audit layer** (entity registry,
+> action→entity binding ledger, ambiguity confirmation marker inside
+> Toolaria's `tool_request` middleware, audit surface). It gates only
+> requests that carry `tla:` handles; there is no blocking
+> `pre_tool_call` hook, no consequential-tool classification, no bypass
+> allowlist, no session/Mnemosyne disambiguation.
+>
+> The original Phase 3 below is **renamed Phase 6 — Pre-execution
+> governor (unbuilt)** and remains future work requiring its own design
+> pass and review cycle.
+
+### Phase 6 — Pre-execution governor (UNBUILT — renamed from original Phase 3)
+
 | ID | Task | Files | Key detail |
 |----|------|-------|-----------|
 | T3.1 | Hook integration | new `governor.py`, `__init__.py register()` | Register blocking `pre_tool_call` (host contract verified: block/approve/modify, single-fire); audit-log-only first |
@@ -80,6 +95,17 @@
 | T3.4 | Enforcement gate | same | Flip from audit to enforce only when Phase 1 harness shows deferral/completion cost within agreed bounds; Dezzy-reviewed UX text |
 
 **Exit criteria:** deferral rate + completion impact reported from harness; Sahil approves enforcement flip.
+
+### Phase 3R — Passref-scoped entity binding + audit (SHIPPED under the old "Phase 3" name)
+
+| ID | Task | Files | Key detail |
+|----|------|-------|-----------|
+| T3R.1 | Entity registry | `entities.py` | Config-driven registry (name/regex → kind, sensitivity); validated at load, ReDoS-bounded, inert when empty |
+| T3R.2 | Action→entity binding ledger | `passref.py`, `ledger.py` | Observe-only rows when tla: tokens co-occur with registered entities; fan-out capped per request; ledger rotation |
+| T3R.3 | Ambiguity confirmation marker | `passref.py` | Multi-kind requests get a deterministic confirm-marker instead of expansion when `confirmation_required: true`; default OFF |
+| T3R.4 | Audit surface | `reporting/value_flow_audit.py`, `/rescuer` | Entity-binding summary in value-flow audit |
+
+**Exit criteria (met):** hermaguard review + remediation complete (`468ffa8`, `f343d11`); adversarial probes green; all gates OFF by default.
 
 ### Phase 4 — Integrity & versioning
 

@@ -315,16 +315,15 @@ except ImportError:
 
 # T4.2: Fernet at-rest encryption (D8 — credential-tier only). The
 # `cryptography` package is an optional extra; the canonical test runner
-# installs it via ``uv run --with cryptography``. When absent we degrade
-# to plaintext (inert default — encryption is gated, not mandatory) and
-# log a single WARNING so an operator who configured a key file sees
-# why their data is still plaintext.
+# installs it via ``uv run --with cryptography``. When absent the store
+# stays inert for UNCONFIGURED stores (no key = plaintext exactly as
+# always), but a CONFIGURED key without the library now REFUSES
+# credential writes — reviewer fix 3, 2026-08-25.
 try:
-    from cryptography.fernet import Fernet as _Fernet, InvalidToken as _FernetInvalidToken
+    from cryptography.fernet import Fernet as _Fernet
     _HAVE_FERNET = True
 except ImportError:
     _Fernet = None  # type: ignore[assignment]
-    _FernetInvalidToken = Exception  # type: ignore[assignment, misc]
     _HAVE_FERNET = False
 
 
@@ -430,10 +429,16 @@ class BlobStore:
 
     def _encryption_active(self) -> bool:
         """True iff ``toolaria_key_file`` is configured AND cryptography
-        is importable. The library check is one-shot — when absent
-        every credential put falls back to plaintext with a single
-        WARNING so the operator sees why their config did not
-        activate encryption.
+        is importable.
+
+        Reviewer fix 3 (2026-08-25 re-review): a CONFIGURED key with a
+        MISSING cryptography package is no longer treated as "inert".
+        That combination previously degraded to silent plaintext for
+        credential puts — an operator who believed encryption was on.
+        Now the put path consults ``_require_encryption_ready`` and
+        REFUSES credential writes (fail closed) when the library is
+        absent; this predicate stays True-only-for-real so inert-mode
+        checks (no key configured at all) keep their meaning.
         """
         if not _HAVE_FERNET:
             if not self._fernet_missing_logged:
@@ -441,12 +446,39 @@ class BlobStore:
                 if kf:
                     logger.warning(
                         "toolaria: cryptography.fernet unavailable; "
-                        "toolaria_key_file=%s configured but encryption "
-                        "is inert (install cryptography to enable). "
-                        "Warning emitted once per process.", kf,
+                        "toolaria_key_file=%s configured — CREDENTIAL "
+                        "WRITES WILL BE REFUSED (fail closed, reviewer "
+                        "fix 3). Install cryptography to enable "
+                        "encryption. Warning emitted once per process.",
+                        kf,
                     )
                 self._fernet_missing_logged = True
             return False
+        return bool(self.cfg.get("toolaria_key_file"))
+
+    def _require_encryption_ready(self) -> None:
+        """Raise unless encryption can actually run.
+
+        Reviewer fix 3: called by every credential-write path. When the
+        operator configured a key file but the cryptography package is
+        missing, we refuse rather than silently store plaintext.
+        """
+        kf = self.cfg.get("toolaria_key_file")
+        if kf and not _HAVE_FERNET:
+            raise _EncryptionUnavailable(
+                f"toolaria_key_file={kf} is configured but the "
+                f"cryptography package is unavailable; refusing to "
+                f"write credential content under plaintext (fail "
+                f"closed). Install 'cryptography' or remove the key "
+                f"setting.")
+
+    def _encryption_configured(self) -> bool:
+        """True iff the operator configured ``toolaria_key_file``.
+
+        Used by fail-closed gates: this must be independent of whether
+        Fernet support actually loaded, so a configured-but-broken
+        environment refuses instead of degrading to plaintext.
+        """
         return bool(self.cfg.get("toolaria_key_file"))
 
     def _load_or_create_fernet(self):
@@ -488,7 +520,7 @@ class BlobStore:
             try:
                 self._fernet = _Fernet(key_bytes)
                 return self._fernet
-            except (ValueError, Exception):
+            except Exception:
                 # Existing key file is corrupt — refuse rather than
                 # overwrite (overwriting would orphan every encrypted
                 # blob written under the previous key). Raise so the
@@ -569,26 +601,26 @@ class BlobStore:
         authoritative source of truth for which on-disk bytes are
         ciphertext vs plaintext.
 
-        HG-M4 (hermaguard Phase 4): results are cached in a per-process
-        ``set`` so repeated reads of the same blob are O(1). The cache
-        is write-through: put() adds to it when stamping enc=True, and
-        a negative result is only cached after one full scan (a blob
-        encrypted by another process later still gets found because
-        this process's own puts keep the set authoritative for shared
-        content — cross-process discovery degrades to the scan, same as
-        pre-HG-M4 behaviour).
+        HG-M4 (hermaguard Phase 4): positive results are cached
+        per-process (a blob that is ciphertext stays ciphertext for its
+        lifetime — content-addressed, never re-encrypted in place
+        except by rotation, which rewrites under lock). NEGATIVE
+        results are NOT cached (reviewer fix 5, 2026-08-25): another
+        process can upgrade a plaintext blob to encrypted at any time,
+        so a cached False would be a stale lie that ends in an
+        integrity-failure read. The common case (plaintext blob read
+        repeatedly) still costs one scan per fetch; the scan is bounded
+        by session count and is unchanged pre-T4.2 behaviour.
         """
         cached = self._enc_cache.get(blob_id)
         if cached is not None:
             return cached
-        found = False
         for ip in sorted(self.meta_dir.glob("*.json")):
             entry = self._read_idx_file(ip).get("blobs", {}).get(blob_id)
             if isinstance(entry, dict) and entry.get("enc") is True:
-                found = True
-                break
-        self._enc_cache[blob_id] = found
-        return found
+                self._enc_cache[blob_id] = True
+                return True
+        return False
 
     def _encrypt_bytes(self, plain: bytes) -> bytes | None:
         """Fernet-encrypt *plain* using the cached key. Returns ``None``
@@ -630,12 +662,15 @@ class BlobStore:
                     f"key file unreadable: {exc}") from exc
             try:
                 self._fernet = _Fernet(key_bytes)
-            except (ValueError, Exception) as exc:
+            except Exception as exc:
                 raise _EncryptionUnavailable(
                     f"key file invalid: {exc}") from exc
         try:
             return self._fernet.decrypt(cipher)
-        except (_FernetInvalidToken, ValueError, Exception) as exc:
+        except Exception as exc:
+            # InvalidToken (wrong key / tampered ciphertext) and any
+            # other failure collapse into the same uniform refusal —
+            # no information leak distinguishing the cause.
             raise _EncryptionUnavailable(
                 f"Fernet decrypt failed for {blob_id}: {exc}") from exc
 
@@ -688,7 +723,7 @@ class BlobStore:
         try:
             old_key_bytes = old_path_p.read_bytes().strip()
             old_fernet = _Fernet(old_key_bytes)
-        except (OSError, ValueError, Exception) as exc:
+        except Exception as exc:
             raise _EncryptionUnavailable(
                 f"old key file {old_path_p} unreadable or invalid: {exc}"
             ) from exc
@@ -707,7 +742,7 @@ class BlobStore:
             try:
                 new_key_bytes = new_path_p.read_bytes().strip()
                 _Fernet(new_key_bytes)  # validate
-            except (OSError, ValueError, Exception) as exc:
+            except Exception as exc:
                 raise _EncryptionUnavailable(
                     f"new key file {new_path_p} unreadable or invalid: "
                     f"{exc}") from exc
@@ -962,16 +997,47 @@ class BlobStore:
 
     def build_outline(self, blob_id: str, text: str) -> dict:
         """Build and cache the structural outline for a blob (cheap, sync).
-        Safe to call at rescue time."""
+        Safe to call at rescue time.
+
+        Reviewer fix 1 (2026-08-25 re-review): encrypted blobs NEVER
+        get sidecars — from any path. The outline is still computed
+        and returned so the caller's response shape is unchanged; only
+        the disk cache is suppressed.
+        """
         kind, _ = _detect_type(text)
         outline = _struct_outline(text, kind, self.cfg)
-        self.write_sidecar(blob_id, "outline", outline)
+        if not self._sidecars_forbidden(blob_id):
+            self.write_sidecar(blob_id, "outline", outline)
         return outline
+
+    def _sidecars_forbidden(self, blob_id: str) -> bool:
+        """True when *blob_id*'s payload is ciphertext at rest.
+
+        Single chokepoint for every sidecar-writing path (outline,
+        chunks, vectors). Plaintext previews of an encrypted blob in a
+        0600 sidecar file defeat at-rest encryption exactly as the
+        original HG-C1 finding described; the rescue-path-only fix left
+        search reachable. When the on-disk state cannot be determined,
+        we err toward suppressing the cache (fail closed for writes).
+        """
+        try:
+            return (self._blob_encrypted(blob_id)
+                    or _looks_like_fernet(
+                        (self.blob_dir / blob_id).read_bytes()))
+        except OSError:
+            return False
 
     def _outline(self, blob_id: str, text: str) -> str:
         cached = self.read_sidecar(blob_id, "outline")
-        if cached is None:
+        if cached is None and not self._sidecars_forbidden(blob_id):
             cached = self.build_outline(blob_id, text)
+            if cached is None:
+                cached = {}
+        if not cached:
+            # No cache available (encrypted blob): compute without
+            # writing. Same output as before, nothing hits disk.
+            kind, _ = _detect_type(text)
+            return _render_outline(_struct_outline(text, kind, self.cfg))
         return _render_outline(cached)
 
     # ── semantic search ──
@@ -979,8 +1045,13 @@ class BlobStore:
     def _chunks(self, blob_id: str, text: str) -> tuple[list[dict], bool]:
         """Line-aligned chunks for a blob, cached as a sidecar.
         Returns (chunks, truncated) where truncated means the blob was larger
-        than search_max_chunks chunks and only the head was indexed."""
-        cached = self.read_sidecar(blob_id, "chunks")
+        than search_max_chunks chunks and only the head was indexed.
+
+        Reviewer fix 1: encrypted blobs compute chunks fresh each time
+        (no plaintext .chunks.json sidecar is ever written).
+        """
+        cached = None if self._sidecars_forbidden(blob_id) \
+            else self.read_sidecar(blob_id, "chunks")
         if cached is not None:
             return cached.get("chunks", []), cached.get("truncated", False)
         target = self.cfg.get("search_chunk_chars", 1200)
@@ -996,24 +1067,32 @@ class BlobStore:
             chunks.append(d)
         truncated = len(chunks) > max_chunks
         chunks = chunks[:max_chunks]
-        self.write_sidecar(blob_id, "chunks", {"chunks": chunks, "truncated": truncated})
+        if not self._sidecars_forbidden(blob_id):
+            self.write_sidecar(blob_id, "chunks",
+                               {"chunks": chunks, "truncated": truncated})
         return chunks, truncated
 
     def _chunk_vectors(self, blob_id: str, chunks: list[dict],
                        model_name: str) -> list[list[float]] | None:
         """Embeddings for a blob's chunks, cached and keyed by model name.
-        None when embeddings are unavailable."""
+        None when embeddings are unavailable.
+
+        Reviewer fix 1: no .vectors.json sidecar for encrypted blobs —
+        embeddings are recomputed per call instead of cached.
+        """
         if not _sem.embeddings_available():
             return None
-        cached = self.read_sidecar(blob_id, "vectors")
+        forbidden = self._sidecars_forbidden(blob_id)
+        cached = None if forbidden else self.read_sidecar(blob_id, "vectors")
         if cached and cached.get("model") == model_name \
                 and len(cached.get("vectors", [])) == len(chunks):
             return cached["vectors"]
         vectors = _sem.embed([c["text"] for c in chunks], model_name)
         if vectors is None:
             return None
-        self.write_sidecar(blob_id, "vectors",
-                           {"model": model_name, "vectors": vectors})
+        if not forbidden:
+            self.write_sidecar(blob_id, "vectors",
+                               {"model": model_name, "vectors": vectors})
         return vectors
 
     def search(self, blob_id: str, query: str, text: str) -> str:
@@ -1048,33 +1127,6 @@ class BlobStore:
         return "\n".join(out)
 
     # ── blob i/o ──────────────────────────
-
-    def _version_chain_head(self, idx: dict, tool_name: str) -> dict | None:
-        """Return the live chain head for *tool_name* in *idx*, or None.
-
-        The chain is per (tool, session) — successive puts from the same
-        tool in the same session form a version chain. This helper picks
-        the current head by scanning entries; O(N) but N is bounded by
-        typical session size and the scan only runs inside the write
-        lock, never on the fetch hot path.
-
-        The returned dict is the live entry itself; callers may mutate
-        it (under the blobstore lock) to advance the chain pointers.
-        """
-        blobs = idx.get("blobs") or {}
-        head: dict | None = None
-        for meta in blobs.values():
-            if not isinstance(meta, dict):
-                continue
-            if meta.get("tool") != tool_name:
-                continue
-            if "swept_at" in meta:
-                continue
-            v = meta.get("version", 1)
-            if v >= 1 and "superseded_by" not in meta:
-                if head is None or v > head.get("version", 0):
-                    head = meta
-        return head
 
     def _resolve_version(self, idx: dict, blob_id: str,
                           requested_version: int) -> str | None:
@@ -1236,6 +1288,12 @@ class BlobStore:
                         final_label = candidate
                         break
                 # Now decide encryption based on the resolved label.
+                # Reviewer fix 3: a configured key with missing crypto
+                # support REFUSES the credential write instead of
+                # silently storing plaintext (fail closed).
+                if final_label == "credential" \
+                        and self._encryption_configured():
+                    self._require_encryption_ready()
                 encrypt_for_put = (
                     final_label == "credential"
                     and self._encryption_active())
@@ -1272,25 +1330,43 @@ class BlobStore:
                         final_label = candidate
                         break
                 # Blob file already exists from a prior put. The on-disk
-                # bytes (plaintext vs ciphertext) are fixed by the
-                # FIRST write — content-addressing means we never
-                # re-write the same bid with a different encoding, so
-                # the enc marker must reflect the ACTUAL on-disk state,
-                # not just this session's prior entry.
+                # encoding is normally fixed by the FIRST write — but a
+                # plaintext blob whose content-owned label UPGRADES to
+                # credential under an active key must be re-encrypted in
+                # place (reviewer fix 2, 2026-08-25): "first write wins"
+                # must never leave a secret sitting at rest in the clear
+                # just because it arrived through a public tool first.
                 #
-                # HG-C2 (hermaguard Phase 4): a fresh session has no
-                # prior entry, so reading only ``existing`` stamps
-                # enc=False for what is really ciphertext — and once
-                # the encrypting session's entry ages out the blob
-                # becomes permanently unreadable (integrity-fail).
-                # Derive from disk bytes: Fernet tokens start with the
-                # version byte 0x80 followed by 8 bytes of timestamp;
-                # plaintext UTF-8 JSON/text virtually never begins with
-                # that signature. Cross-check with any other session's
-                # entry via _blob_encrypted for belt-and-braces.
+                # HG-C2 (hermaguard Phase 4): the enc marker is still
+                # derived from on-disk reality (existing entry ∨
+                # cross-session scan ∨ Fernet 0x80-magic) so ciphertext
+                # is never mis-marked as plaintext.
                 enc_marker = bool(existing.get("enc", False)) \
                     or self._blob_encrypted(bid) \
                     or _looks_like_fernet(bpath.read_bytes())
+                # Reviewer fix 3: same fail-closed rule on the upgrade
+                # path — configured key without cryptography refuses.
+                if final_label == "credential" \
+                        and self._encryption_configured():
+                    self._require_encryption_ready()
+                upgrade_encrypt = (
+                    final_label == "credential"
+                    and self._encryption_active()
+                    and not enc_marker)
+                if upgrade_encrypt:
+                    try:
+                        cipher = self._encrypt_bytes(raw)
+                    except _EncryptionUnavailable as exc:
+                        logger.warning(
+                            "toolaria: T4.2 key unavailable for "
+                            "credential-upgrade of %s (%s); refusing "
+                            "to leave the blob at rest under plaintext",
+                            bid, exc,
+                        )
+                        raise
+                    if cipher is not None:
+                        self._atomic_write_blob(bpath, cipher)
+                        enc_marker = True
             # T4.1: version chain (per (tool, session)).
             #
             #  - If there's an existing live head for this (tool,
@@ -1367,10 +1443,14 @@ class BlobStore:
                 new_entry["version"] = 1
 
             idx["blobs"][bid] = new_entry
-            # HG-M4: keep the O(1) encrypted-lookup cache in sync with
-            # the authoritative index stamp (write-through on True;
-            # a False here invalidates any stale positive).
-            self._enc_cache[bid] = bool(enc_marker)
+            # HG-M4 (as amended by reviewer fix 5): cache positives only.
+            # A False here must not poison the cache — this process's
+            # own upgrade-encrypt path may have just flipped the blob to
+            # ciphertext, and other processes can do so at any time.
+            if enc_marker:
+                self._enc_cache[bid] = True
+            else:
+                self._enc_cache.pop(bid, None)
             # FIX-2: credential-slice cumulative-chars counter (resets on
             # sweep). Seed only to make the field visible to audit
             # tooling; _charge_slice_budget's .get default handles absence.

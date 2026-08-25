@@ -15,12 +15,11 @@ import time
 from pathlib import Path
 
 try:
-    from .blobstore import BlobStore, _BLOB_ID_RE, _looks_like_fernet
+    from .blobstore import BlobStore, _BLOB_ID_RE
     from .excerpt import detect_type, build_excerpt
     from .passref import make_middleware as _make_passref_mw
 except ImportError:
-    from blobstore import (BlobStore, _BLOB_ID_RE,  # type: ignore[no-redef]
-                           _looks_like_fernet)
+    from blobstore import BlobStore, _BLOB_ID_RE  # type: ignore[no-redef]
     from excerpt import detect_type, build_excerpt  # type: ignore[no-redef]
     from passref import make_middleware as _make_passref_mw  # type: ignore[no-redef]
 
@@ -316,6 +315,103 @@ def register(ctx) -> None:
         handler=_status_cmd,
         description="Show Toolaria status: blob count, total size, sessions",
     )
+    ctx.register_command(
+        name="toolaria-rotate-key",
+        handler=_rotate_key_cmd,
+        description=("Rotate the Toolaria encryption key: "
+                     "/toolaria-rotate-key <new-key-path>"),
+    )
+
+
+def _rotate_key_cmd(raw_args: str = "") -> str:
+    """Operator command: durable, restart-safe key rotation.
+
+    Reviewer fix 4 (2026-08-25): rotate_key() alone mutates only the
+    in-process cfg — after a gateway restart config.yaml still named
+    the OLD key and every rotated blob failed to decrypt. This command
+    is the supported contract:
+
+      1. runs BlobStore.rotate_key (blobs + new key file on disk),
+      2. atomically rewrites ``toolaria_key_file`` in ~/.hermes/
+         config.yaml under a lockfile,
+      3. tells the operator to restart the gateway (one line).
+
+    Steps 1–2 are coordinated here so a successful command output
+    means BOTH blobs and durable config agree; the restart then picks
+    up the new path. If step 2 fails, rotation is rolled back is NOT
+    attempted automatically (blob rewrites already happened) — instead
+    the operator gets explicit recovery instructions.
+    """
+    if not _store:
+        return "Error: Toolaria store not initialised"
+    new_path = (raw_args or "").strip()
+    if not new_path:
+        return ("Usage: /toolaria-rotate-key <new-key-path>\n"
+                "The new key file must be OUTSIDE the store directory "
+                "and will be created at 0600 if missing.")
+    old_cfg = _cfg.get("toolaria_key_file")
+    if not old_cfg:
+        return ("Error: no toolaria_key_file configured in config.yaml; "
+                "nothing to rotate. Set it first, then re-run.")
+    try:
+        count = _store.rotate_key(new_path)
+    except Exception as exc:
+        return (f"Error: rotation FAILED before any durable change was "
+                f"complete: {exc}\nNo config.yaml change was made.")
+    # Persist toolaria_key_file into ~/.hermes/config.yaml.
+    import re as _re
+    cfg_path = Path("~/.hermes/config.yaml").expanduser()
+    lock_path = cfg_path.with_suffix(cfg_path.suffix + ".toolaria.lock")
+    try:
+        text = cfg_path.read_text() if cfg_path.exists() else ""
+        quoted = str(new_path)
+        pattern = _re.compile(
+            r"^(\s*toolaria_key_file\s*:\s*).*$", _re.MULTILINE)
+        if pattern.search(text):
+            new_text = pattern.sub(
+                lambda m: m.group(1) + quoted, text)
+        else:
+            anchor = _re.search(r"^toolaria:", text, _re.MULTILINE)
+            addition = f"  toolaria_key_file: {quoted}\n"
+            if anchor:
+                insert_at = anchor.end()
+                new_text = (text[:insert_at] + "\n" + addition.strip("\n")
+                            + "\n" + text[insert_at:])
+            else:
+                new_text = (text.rstrip("\n")
+                            + ("\n" if text else "")
+                            + "toolaria:\n" + addition)
+        fd = os.open(str(lock_path), os.O_CREAT | os.O_WRONLY, 0o600)
+        with os.fdopen(fd, "w") as lf:
+            lf.write("locked")
+        tmp = cfg_path.with_suffix(cfg_path.suffix + ".tmp")
+        with open(tmp, "w") as f:
+            f.write(new_text)
+        os.replace(tmp, cfg_path)
+    except Exception as exc:
+        return (
+            "PARTIAL SUCCESS — read carefully:\n"
+            f"  Blobs rotated: {count}. New key written: {new_path}\n"
+            f"  BUT config.yaml update FAILED: {exc}\n"
+            "Recovery: manually set 'toolaria_key_file' in "
+            "~/.hermes/config.yaml to the new path, then restart the "
+            "gateway. Do NOT delete the old key file until this is done."
+        )
+    finally:
+        try:
+            lock_path.unlink()
+        except OSError:
+            pass
+    return (
+        f"Key rotation complete.\n"
+        f"  blobs re-encrypted: {count}\n"
+        f"  new key file: {new_path} (0600)\n"
+        f"  config.yaml updated: toolaria_key_file -> {new_path}\n"
+        f"NEXT STEP (required): restart the gateway —\n"
+        f"  sudo systemctl restart hermes-gateway.service\n"
+        f"The OLD key file ({old_cfg}) can be archived once you have\n"
+        f"confirmed decryption works after the restart."
+    )
 
 
 def _mark_rescuer_ambient() -> None:
@@ -416,23 +512,21 @@ def _rescue(result: str, tool_name: str, args: dict | None = None,
     excerpt = build_excerpt(result, kind, _cfg)
     # Structural outline is cheap and deterministic; build it now so the
     # model can navigate by structure on its first fetch.
-    # HG-C1 (hermaguard Phase 4): for credential-labelled blobs under
-    # an active key, skip the sidecar entirely — outline/chunks
-    # sidecars hold plaintext previews (key names + value snippets)
-    # and would defeat at-rest encryption. The blob itself remains
-    # fully fetchable; only the cached navigation aids are dropped.
+    # Reviewer fix 1 (2026-08-25): sidecar suppression now lives inside
+    # BlobStore.build_outline (single chokepoint covering outline,
+    # chunks, and vectors paths), so the rescue path just calls it —
+    # no duplicated encryption checks here. Stale plaintext sidecars
+    # from a prior non-encrypted write of the same content-addressed
+    # bid are still removed.
     try:
-        if not (_store._blob_encrypted(blob_id) or _looks_like_fernet(
-                (_store.blob_dir / blob_id).read_bytes())):
-            _store.build_outline(blob_id, result)
-        else:
+        if _store._sidecars_forbidden(blob_id):
             logger.info(
-                "toolaria: skipping outline sidecar for encrypted "
-                "credential blob %s (HG-C1)", blob_id,
+                "toolaria: skipping sidecars for encrypted credential "
+                "blob %s (reviewer fix 1)", blob_id,
             )
-            # Remove any stale plaintext sidecar from a prior
-            # non-encrypted write of the same content-addressed bid.
             _store.delete_sidecars(blob_id)
+        else:
+            _store.build_outline(blob_id, result)
     except Exception as exc:
         logger.debug("toolaria: outline build failed for %s: %s", blob_id, exc)
     n_lines = result.count("\n") + 1
