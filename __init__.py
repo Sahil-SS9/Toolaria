@@ -15,11 +15,12 @@ import time
 from pathlib import Path
 
 try:
-    from .blobstore import BlobStore, _BLOB_ID_RE
+    from .blobstore import BlobStore, _BLOB_ID_RE, _looks_like_fernet
     from .excerpt import detect_type, build_excerpt
     from .passref import make_middleware as _make_passref_mw
 except ImportError:
-    from blobstore import BlobStore, _BLOB_ID_RE  # type: ignore[no-redef]
+    from blobstore import (BlobStore, _BLOB_ID_RE,  # type: ignore[no-redef]
+                           _looks_like_fernet)
     from excerpt import detect_type, build_excerpt  # type: ignore[no-redef]
     from passref import make_middleware as _make_passref_mw  # type: ignore[no-redef]
 
@@ -415,8 +416,23 @@ def _rescue(result: str, tool_name: str, args: dict | None = None,
     excerpt = build_excerpt(result, kind, _cfg)
     # Structural outline is cheap and deterministic; build it now so the
     # model can navigate by structure on its first fetch.
+    # HG-C1 (hermaguard Phase 4): for credential-labelled blobs under
+    # an active key, skip the sidecar entirely — outline/chunks
+    # sidecars hold plaintext previews (key names + value snippets)
+    # and would defeat at-rest encryption. The blob itself remains
+    # fully fetchable; only the cached navigation aids are dropped.
     try:
-        _store.build_outline(blob_id, result)
+        if not (_store._blob_encrypted(blob_id) or _looks_like_fernet(
+                (_store.blob_dir / blob_id).read_bytes())):
+            _store.build_outline(blob_id, result)
+        else:
+            logger.info(
+                "toolaria: skipping outline sidecar for encrypted "
+                "credential blob %s (HG-C1)", blob_id,
+            )
+            # Remove any stale plaintext sidecar from a prior
+            # non-encrypted write of the same content-addressed bid.
+            _store.delete_sidecars(blob_id)
     except Exception as exc:
         logger.debug("toolaria: outline build failed for %s: %s", blob_id, exc)
     n_lines = result.count("\n") + 1

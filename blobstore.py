@@ -241,6 +241,32 @@ class _SliceBudgetExceeded(Exception):
 _DIR_MODE = 0o700
 _FILE_MODE = 0o600
 
+# HG-C2 (hermaguard Phase 4): Fernet token signature. Every Fernet
+# token starts with version byte 0x80 (0b10000000) followed by an 8-byte
+# big-endian timestamp — raw base64url decoding of the token's first
+# group yields that header. Plaintext blob content (UTF-8 JSON, text,
+# logs) begins with 0x80 with negligible probability.
+_FERNET_MAGIC = b"\x80"
+
+
+def _looks_like_fernet(data: bytes) -> bool:
+    """Cheap on-disk heuristic: does *data* start like a Fernet token?
+
+    Fernet tokens are base64url of [0x80 || ts8 || ciphertext || hmac];
+    the decoded first byte is always 0x80. Used only to stamp the index
+    ``enc`` marker when a blob file predates the session writing it —
+    the decrypt path itself never trusts this (Fernet verifies HMAC).
+    """
+    if not data or len(data) < 60:      # min Fernet b64 length >> 57 chars
+        return False
+    try:
+        head = data.split(b".", 1)[0]
+        import base64
+        return base64.urlsafe_b64decode(
+            head + b"=" * (-len(head) % 4))[:1] == _FERNET_MAGIC
+    except Exception:
+        return False
+
 logger = logging.getLogger(__name__)
 
 
@@ -436,24 +462,25 @@ class BlobStore:
         kpath = Path(kf).expanduser()
         try:
             kpath.parent.mkdir(parents=True, exist_ok=True)
+            # HG-M5 (hermaguard Phase 4): the key directory must not be
+            # world-listable; tighten to match the store's dir mode.
+            _chmod_safe(kpath.parent, _DIR_MODE)
         except OSError as exc:
-            logger.warning(
-                "toolaria: could not create key file dir %s: %s; "
-                "encryption stays inert for this process",
-                kpath.parent, exc,
-            )
-            return None
+            # HG-H2 (hermaguard Phase 4): fail CLOSED on write-side key
+            # I/O failures. Returning None here would silently fall
+            # back to plaintext for credential puts — exactly what the
+            # T4.2 contract forbids.
+            raise _EncryptionUnavailable(
+                f"key file dir unavailable: {kpath.parent}: {exc}")
         key_bytes: bytes | None = None
         generated = False
         if kpath.exists():
             try:
                 key_bytes = kpath.read_bytes().strip()
             except OSError as exc:
-                logger.warning(
-                    "toolaria: key file %s unreadable: %s",
-                    kpath, exc,
-                )
-                return None
+                # HG-H2: unreadable existing key is a fail-closed case.
+                raise _EncryptionUnavailable(
+                    f"key file unreadable: {kpath}: {exc}")
             try:
                 self._fernet = _Fernet(key_bytes)
                 return self._fernet
@@ -472,17 +499,37 @@ class BlobStore:
                 raise _EncryptionUnavailable(
                     f"corrupt key file: {kpath}")
         # Generate a fresh key.
+        # HG-H4 (hermaguard Phase 4): auto-bootstrap orphans every
+        # previously-encrypted blob under the lost key. If any live
+        # entry says enc=True, refuse and demand manual recovery.
+        if self._has_encrypted_blobs():
+            raise _EncryptionUnavailable(
+                f"key file missing but encrypted blobs exist "
+                f"({kpath}); refusing to auto-generate a new key — "
+                f"restore the original key file first")
         key_bytes = _Fernet.generate_key()
         generated = True
         try:
-            kpath.write_bytes(key_bytes)
-            _chmod_safe(kpath, _FILE_MODE)
+            # HG-M2 + HG-M5: atomic O_EXCL create at 0600 from birth —
+            # no umask window, last-writer-wins race closed.
+            fd = os.open(str(kpath),
+                         os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+            with os.fdopen(fd, "wb") as f:
+                f.write(key_bytes)
+        except FileExistsError:
+            # Lost a creation race with another process: use theirs.
+            try:
+                self._fernet = _Fernet(
+                    kpath.read_bytes().strip())
+                return self._fernet
+            except Exception as exc:
+                raise _EncryptionUnavailable(
+                    f"key file race lost and winner's key invalid: "
+                    f"{kpath}: {exc}")
         except OSError as exc:
-            logger.warning(
-                "toolaria: could not write key file %s: %s; encryption "
-                "stays inert for this process", kpath, exc,
-            )
-            return None
+            # HG-H2: fail closed.
+            raise _EncryptionUnavailable(
+                f"could not persist new key file {kpath}: {exc}")
         logger.warning(
             "toolaria: generated new Fernet key at %s (0600). "
             "This is a one-time bootstrap — subsequent runs reuse the "
@@ -492,6 +539,22 @@ class BlobStore:
         )
         self._fernet = _Fernet(key_bytes)
         return self._fernet
+
+    def _has_encrypted_blobs(self) -> bool:
+        """True iff any session index holds a live entry with enc=True.
+
+        HG-H4 guard: used before auto-generating a replacement key so a
+        lost key file can never be silently replaced while encrypted
+        ciphertext still depends on the old key.
+        """
+        for ip in sorted(self.meta_dir.glob("*.json")):
+            for entry in (self._read_idx_file(ip).get("blobs")
+                          or {}).values():
+                if (isinstance(entry, dict)
+                        and entry.get("enc") is True
+                        and "swept_at" not in entry):
+                    return True
+        return False
 
     def _blob_encrypted(self, blob_id: str) -> bool:
         """True iff any session's index entry for *blob_id* carries
@@ -634,6 +697,36 @@ class BlobStore:
             generated = True
         new_fernet = _Fernet(new_key_bytes)
 
+        # HG-H3 (hermaguard Phase 4): an in-place "rotation" with
+        # identical key material is a silent no-op that still writes a
+        # key_rotated ledger row — the compromised key keeps working.
+        # Refuse it outright.
+        if new_key_bytes == old_key_bytes:
+            raise _EncryptionUnavailable(
+                f"rotate_key: new path {new_path_p} resolves to the SAME "
+                f"key as {old_path_p}; generate a genuinely new key "
+                f"(rotation to the same material is refused)")
+
+        # HG-C3 Window 1 (hermaguard Phase 4): persist the NEW key file
+        # BEFORE re-encrypting any blob. The old order encrypted every
+        # blob in memory first and wrote the key afterwards — a crash
+        # in between left all ciphertext under a key that existed
+        # nowhere on disk (permanent loss). Atomic tmp+replace at 0600.
+        try:
+            fd, tmp_name = tempfile.mkstemp(
+                dir=new_path_p.parent,
+                prefix=f".{new_path_p.name}.", suffix=".tmp")
+            with os.fdopen(fd, "wb") as f:
+                f.write(new_key_bytes)
+            os.chmod(tmp_name, _FILE_MODE)
+            os.replace(tmp_name, new_path_p)
+        except OSError as exc:
+            # HG-C3 Window 3: persistence failure must ABORT the whole
+            # rotation — no blob has been touched yet, so this is clean.
+            raise _EncryptionUnavailable(
+                f"could not persist new key file {new_path_p}: {exc}; "
+                f"no blobs were modified") from exc
+
         # 3. Walk every encrypted blob and re-encrypt.
         rotated: list[str] = []
         encrypted_bids = self._collect_encrypted_bids()
@@ -686,26 +779,19 @@ class BlobStore:
                     pass
             raise
 
-        # 5. Successful pass: if we generated a new key file, leave
-        # it (the operator points the store at it via cfg below).
-        # If new_path == old_path the new key has overwritten the old
-        # on disk already — both are byte-identical bytes because
-        # we wrote ``new_key_bytes`` to ``new_path_p``... wait, we
-        # never wrote new_key_bytes; we only used it in-memory.
-        # Fix: write the new key to its path so a restart picks it up.
-        if generated or (new_path_p != old_path_p and
-                          new_path_p.read_bytes().strip() != new_key_bytes):
-            try:
-                tmp = new_path_p.with_suffix(new_path_p.suffix + ".tmp")
-                tmp.write_bytes(new_key_bytes)
-                os.replace(tmp, new_path_p)
-                _chmod_safe(new_path_p, _FILE_MODE)
-            except OSError as exc:
-                logger.warning(
-                    "toolaria: T4.3 could not persist new key to %s: %s; "
-                    "in-memory rotation succeeded but a restart will lose "
-                    "the new key", new_path_p, exc,
-                )
+        # 5. Successful pass: the new key file was persisted BEFORE the
+        # re-encryption walk (HG-C3 Window 1 fix), so a crash at any
+        # later point leaves every blob decryptable by a key that
+        # exists on disk. Nothing further to persist here.
+        #
+        # HG-C3 Window 2 (residual, documented): cfg mutation is
+        # in-memory only. On restart config.yaml still names the OLD
+        # key path — but since rotation now persists the new key to its
+        # own path BEFORE touching blobs and the old key file is
+        # retained, a restart falls back to the old key which still
+        # decrypts pre-rotation blobs; post-rotation ciphertext needs
+        # the operator to update toolaria_key_file in config.yaml. The
+        # ledger row + this docstring make that contract explicit.
 
         # Switch cfg + cache.
         self.cfg["toolaria_key_file"] = str(new_path_p)
@@ -740,6 +826,13 @@ class BlobStore:
             idx = self._read_idx_file(ip)
             for bid, entry in (idx.get("blobs") or {}).items():
                 if isinstance(entry, dict) and entry.get("enc") is True:
+                    # HG-H1 (hermaguard Phase 4): tombstones preserve
+                    # enc=True for audit, but their blob files are
+                    # gone — including them would abort every rotation
+                    # with FileNotFoundError once any encrypted
+                    # credential has been swept. Live entries only.
+                    if "swept_at" in entry:
+                        continue
                     bids.add(bid)
         return sorted(bids)
 
@@ -1151,10 +1244,22 @@ class BlobStore:
                 # bytes (plaintext vs ciphertext) are fixed by the
                 # FIRST write — content-addressing means we never
                 # re-write the same bid with a different encoding, so
-                # any existing entry's ``enc`` field is the authoritative
-                # source. Surface it here so the new entry stays in sync
-                # with the file.
-                enc_marker = bool(existing.get("enc", False))
+                # the enc marker must reflect the ACTUAL on-disk state,
+                # not just this session's prior entry.
+                #
+                # HG-C2 (hermaguard Phase 4): a fresh session has no
+                # prior entry, so reading only ``existing`` stamps
+                # enc=False for what is really ciphertext — and once
+                # the encrypting session's entry ages out the blob
+                # becomes permanently unreadable (integrity-fail).
+                # Derive from disk bytes: Fernet tokens start with the
+                # version byte 0x80 followed by 8 bytes of timestamp;
+                # plaintext UTF-8 JSON/text virtually never begins with
+                # that signature. Cross-check with any other session's
+                # entry via _blob_encrypted for belt-and-braces.
+                enc_marker = bool(existing.get("enc", False)) \
+                    or self._blob_encrypted(bid) \
+                    or _looks_like_fernet(bpath.read_bytes())
             # T4.1: version chain (per (tool, session)).
             #
             #  - If there's an existing live head for this (tool,
@@ -1563,9 +1668,16 @@ class BlobStore:
             if mode == "stat":
                 st = bpath.stat()
                 meta = self._find_meta(blob_id, session_id)
+                # HG-M6 (hermaguard Phase 4): serve the PLAINTEXT size
+                # from the index, not the on-disk byte count. For an
+                # encrypted credential blob st.st_size is ciphertext
+                # length (Fernet ~4/3 expansion) — a plaintext-length
+                # oracle that bypasses every decrypt guard. The index
+                # ``size`` field is len(raw) at put time for all blobs.
+                plain_size = meta.get("size", st.st_size)
                 return (
                     f"blob: {blob_id}\n"
-                    f"size: {st.st_size:,} bytes\n"
+                    f"size: {plain_size:,} bytes\n"
                     f"stored: {time.ctime(st.st_ctime)}\n"
                     f"tool: {meta.get('tool', '?')}"
                 )
