@@ -421,6 +421,10 @@ class BlobStore:
         # the hot path O(1) after the first credential put.
         self._fernet = None
         self._fernet_missing_logged = False
+        # HG-M4 (hermaguard Phase 4): O(1) encrypted-bid lookup cache.
+        # None = unknown (scan needed), True/False = cached verdict.
+        # Written through by put() when it stamps enc=True.
+        self._enc_cache: dict[str, bool] = {}
 
     # ── T4.2 encryption helpers (Fernet at-rest, credential-only) ─────
 
@@ -564,12 +568,27 @@ class BlobStore:
         cannot produce a false positive — the entry field is the
         authoritative source of truth for which on-disk bytes are
         ciphertext vs plaintext.
+
+        HG-M4 (hermaguard Phase 4): results are cached in a per-process
+        ``set`` so repeated reads of the same blob are O(1). The cache
+        is write-through: put() adds to it when stamping enc=True, and
+        a negative result is only cached after one full scan (a blob
+        encrypted by another process later still gets found because
+        this process's own puts keep the set authoritative for shared
+        content — cross-process discovery degrades to the scan, same as
+        pre-HG-M4 behaviour).
         """
+        cached = self._enc_cache.get(blob_id)
+        if cached is not None:
+            return cached
+        found = False
         for ip in sorted(self.meta_dir.glob("*.json")):
             entry = self._read_idx_file(ip).get("blobs", {}).get(blob_id)
             if isinstance(entry, dict) and entry.get("enc") is True:
-                return True
-        return False
+                found = True
+                break
+        self._enc_cache[blob_id] = found
+        return found
 
     def _encrypt_bytes(self, plain: bytes) -> bytes | None:
         """Fernet-encrypt *plain* using the cached key. Returns ``None``
@@ -728,21 +747,33 @@ class BlobStore:
                 f"no blobs were modified") from exc
 
         # 3. Walk every encrypted blob and re-encrypt.
+        #
+        # HG-M3 (hermaguard Phase 4): the whole walk runs under the
+        # process-global _LOCK. Without it a concurrent put() encrypts
+        # under the OLD cached Fernet after the bid snapshot is taken;
+        # that blob then never enters this rotation and becomes
+        # orphaned when self._fernet swaps to the new key. Holding
+        # _LOCK means puts either land before the snapshot (old key,
+        # included in the walk) or after the swap (new key, correct).
+        # Cross-process callers are out of scope here: rotate_key is an
+        # operator-invoked maintenance action; multi-process rotation is
+        # rejected by the cfg-restart contract documented at step 5.
         rotated: list[str] = []
-        encrypted_bids = self._collect_encrypted_bids()
         last_exc: Exception | None = None
         try:
-            for bid in encrypted_bids:
-                bpath = self.blob_dir / bid
-                try:
-                    cipher_old = bpath.read_bytes()
-                    plain = old_fernet.decrypt(cipher_old)
-                    cipher_new = new_fernet.encrypt(plain)
-                    self._atomic_write_blob(bpath, cipher_new)
-                    rotated.append(bid)
-                except Exception as exc:
-                    last_exc = exc
-                    raise
+            with _LOCK:
+                encrypted_bids = self._collect_encrypted_bids()
+                for bid in encrypted_bids:
+                    bpath = self.blob_dir / bid
+                    try:
+                        cipher_old = bpath.read_bytes()
+                        plain = old_fernet.decrypt(cipher_old)
+                        cipher_new = new_fernet.encrypt(plain)
+                        self._atomic_write_blob(bpath, cipher_new)
+                        rotated.append(bid)
+                    except Exception as exc:
+                        last_exc = exc
+                        raise
         except Exception:
             # 4. Abort-safety: roll back the already-rotated blobs.
             logger.warning(
@@ -1336,6 +1367,10 @@ class BlobStore:
                 new_entry["version"] = 1
 
             idx["blobs"][bid] = new_entry
+            # HG-M4: keep the O(1) encrypted-lookup cache in sync with
+            # the authoritative index stamp (write-through on True;
+            # a False here invalidates any stale positive).
+            self._enc_cache[bid] = bool(enc_marker)
             # FIX-2: credential-slice cumulative-chars counter (resets on
             # sweep). Seed only to make the field visible to audit
             # tooling; _charge_slice_budget's .get default handles absence.
