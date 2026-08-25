@@ -90,6 +90,16 @@ hermes plugin reload
 Any oversized web extract, search, or MCP result now returns a compact excerpt
 with a fetch handle instead of flooding context. Check status with `/rescuer`.
 
+Run the test suite:
+
+```bash
+# Canonical runner (needs the regex package for the grep timeout tests)
+uv run --with pytest --with regex python -m pytest tests/ -q
+
+# With encryption-tier tests (needs the cryptography package)
+uv run --with pytest --with regex --with cryptography python -m pytest tests/ -q
+```
+
 > **Availability in restricted sessions.** The rescue runs as an ungated hook, so
 > it fires in every session, including toolset-restricted ones (cron jobs, scoped
 > profiles). For the `rescuer_fetch` handle to be redeemable there, the tool must
@@ -191,6 +201,45 @@ All keys in `config.yaml` with defaults:
 | `passref_max_chars` | `500000` | Cap on content expanded per token |
 | `passref_total_max_chars` | `2000000` | Cap on total expansion per tool call |
 | `passref_allowed_tools` | `[]` | Strict allowlist; empty means all but exec/exfil sinks |
+| `toolaria_key_file` | *(unset)* | Path to a Fernet key file for credential-tier encryption (see below) |
+| `sensitivity_tool_labels` | `{}` | `{tool_name: label}` overrides for the built-in tool→label map |
+
+---
+
+## Sensitivity labels
+
+Every rescued result carries a label: `public`, `personal`, or `credential`.
+Labels come from a built-in tool map (mail tools default to `personal`, web
+tools to `public`), overridable per tool with `sensitivity_tool_labels`. When
+content is referenced from several sessions the most sensitive label wins.
+
+Credential-labelled content is handled carefully: slices shown to the model
+are masked, per-blob byte budgets apply, and expansion into exec/exfil sinks
+is denied. Enforcement is **audit-first**: it ships off by default and flips
+on only when you configure it.
+
+---
+
+## Encryption (optional)
+
+Credential-tier blobs can be encrypted at rest with Fernet. It is off by
+default and stays byte-for-byte identical to today's plaintext store until
+you opt in.
+
+1. Generate a key (mode 0600, outside the store directory):
+   `python -c "from cryptography.fernet import Fernet; open('/home/you/.hermes/secrets/toolaria.key','wb').write(Fernet.generate_key())"`
+2. Point the plugin at it in `config.yaml`:
+   `toolaria.toolaria_key_file: /home/you/.hermes/secrets/toolaria.key`
+3. Restart the gateway. Credential-labelled blobs now write ciphertext.
+
+Notes:
+- `cryptography` must be installed; with a key configured but the package
+  missing, credential writes are **refused** rather than silently stored as
+  plaintext.
+- Rotate keys with the `/toolaria-rotate-key <new-key-path>` command — it
+  re-encrypts blobs, updates the durable config atomically, and preserves
+  config permissions.
+- **Back up the key file.** Losing it makes every encrypted blob unreadable.
 
 ---
 

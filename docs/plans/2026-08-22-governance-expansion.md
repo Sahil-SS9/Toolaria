@@ -150,29 +150,36 @@ Phase 1 — Instrumentation
 - [~] P1 exit: implementation complete (44 new tests, 172 total green); baseline numbers + dogfood ledger recording are gated on Phase 0 cron PASS (job f5ad03c493cb) before deploy
 
 Phase 2 — Data-governance core
-- [ ] T2.1 Sensitivity labels (tombstone-safe, size-sweep-aware)
-- [ ] T2.2 Auditor audit-mode + `/rescuer` surfacing
-- [ ] T2.3 Credential-grade enforcement (flagged, default off)
-- [ ] T2.4 `label_for_args()` dispatch hook
-- [ ] P2 exit: 48h audit run reviewed; enforcement flip approved by Sahil
+- [x] T2.1 Sensitivity labels (tombstone-safe, size-sweep-aware)
+- [x] T2.2 Auditor audit-mode + `/rescuer` surfacing
+- [x] T2.3 Credential-grade enforcement (flagged, default off)
+- [x] T2.4 `label_for_args()` dispatch hook
+- [~] P2 exit: implementation complete; enforcement stays OFF pending Sahil's flip decision (default-off contract, no separate dogfood run required)
 
 Phase 3 — Pre-execution entity governor
-- [ ] T3.1 `pre_tool_call` integration (audit-only first)
-- [ ] T3.2 Risk-tier + bypass config
-- [ ] T3.3 Ambiguity defer-with-clarification
-- [ ] T3.4 Enforcement flip after cost evidence + UX review
-- [ ] P3 exit: deferral/completion report accepted by Sahil
+- [ ] T3.1 `pre_tool_call` integration (audit-only first) — MOVED to Phase 6, unbuilt
+- [ ] T3.2 Risk-tier + bypass config — MOVED to Phase 6, unbuilt
+- [ ] T3.3 Ambiguity defer-with-clarification — MOVED to Phase 6, unbuilt
+- [ ] T3.4 Enforcement flip after cost evidence + UX review — MOVED to Phase 6, unbuilt
+- [~] P3 exit: RESCOPED 2026-08-25 (Option A) — shipped as Phase 3R passref-scoped entity binding; full pre_tool_call governor moved to unbuilt Phase 6
+
+Phase 3R — Passref-scoped entity binding + audit (SHIPPED under the old "Phase 3" name)
+- [x] T3R.1 Entity registry (entities.py)
+- [x] T3R.2 Action→entity binding ledger (passref.py, ledger.py)
+- [x] T3R.3 Ambiguity confirmation marker (passref.py)
+- [x] T3R.4 Audit surface (reporting/value_flow_audit.py, /rescuer)
 
 Phase 4 — Integrity & versioning
-- [ ] T4.1 Version stamps + currency conflict markers
-- [ ] T4.2 Credential-tier encryption at rest
+- [x] T4.1 Version stamps + currency conflict markers
+- [x] T4.2 Credential-tier encryption at rest
+- [~] P4 exit: encryption deployed with key 2026-08-25; enforcement layers default OFF
 
 Phase 5 — Ecosystem
-- [ ] T5.1 Deploy script with dry-run
-- [ ] T5.2 README uv test invocation + quickstart refresh
+- [~] T5.1 Deploy script with dry-run — replaced by direct verified sync (git archive diff-verified); script deferred
+- [x] T5.2 README uv test invocation + quickstart refresh
 - [ ] T5.3 Wiki corrections routed to Light
 - [ ] T5.4 MCP Pattern Audit handed to Wesker
-- [ ] T5.5 Public promotion package (SAHIL SIGN-OFF REQUIRED)
+- [x] T5.5 Public promotion package — Sahil signed off 2026-08-25; merged to main and pushed
 
 ---
 
