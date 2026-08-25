@@ -22,10 +22,10 @@ try:
     from .index import render_outline as _render_outline
     from .chunking import chunk_lines as _chunk_lines
     from . import semantic as _sem
-    from labels import (label_for_tool, label_for_args as _label_for_args,
+    from .labels import (label_for_tool, label_for_args as _label_for_args,
                               VALID_LABELS, _LABEL_UPGRADE_PATTERNS,
                               _BUILTIN_TOOL_LABELS)
-    from entities import (get_registry as _entity_registry,
+    from .entities import (get_registry as _entity_registry,
                               extract_entities as _extract_entities,
                               distinct_entity_kinds as _distinct_entity_kinds)
 except ImportError:
@@ -865,7 +865,10 @@ class BlobStore:
 
         # 6. Ledger row.
         try:
-            from ledger import log_key_rotation
+            try:
+                from .ledger import log_key_rotation
+            except ImportError:
+                from ledger import log_key_rotation  # type: ignore[no-redef]
             log_key_rotation(
                 self.cfg, count=len(rotated),
                 old_key_file=str(old_path_p),
@@ -1786,8 +1789,14 @@ class BlobStore:
             if blob_label is None:
                 blob_label = "credential"
             if blob_label == "credential":
-                from passref import (CREDENTIAL_REFUSE_MARKER_PREFIX,
-                                     CREDENTIAL_REFUSE_MARKER_SUFFIX)
+                try:
+                    from .passref import (CREDENTIAL_REFUSE_MARKER_PREFIX,
+                                          CREDENTIAL_REFUSE_MARKER_SUFFIX)
+                except ImportError:
+                    from passref import (  # type: ignore[no-redef]
+                        CREDENTIAL_REFUSE_MARKER_PREFIX,
+                        CREDENTIAL_REFUSE_MARKER_SUFFIX,
+                    )
                 return (f"{CREDENTIAL_REFUSE_MARKER_PREFIX}{blob_id}"
                         f"{CREDENTIAL_REFUSE_MARKER_SUFFIX}")
 

@@ -158,13 +158,19 @@ def _merge_cfg(user_cfg: dict) -> dict:
     # raises ValueError listing offending keys/values; we let that
     # bubble up to register() and abort plugin load so the operator
     # sees the typo before any rescue runs.
-    from labels import _parse_tool_label_map
+    try:
+        from .labels import _parse_tool_label_map
+    except ImportError:
+        from labels import _parse_tool_label_map  # type: ignore[no-redef]
     _parse_tool_label_map(defaults.get("sensitivity_tool_labels"))
     # T3.1: validate the entity_registry the same way so a broken
     # pattern/regex/sensitivity never silently disables the governor
     # or leaks into a half-broken put().
     try:
-        from entities import parse_entity_registry
+        try:
+            from .entities import parse_entity_registry
+        except ImportError:
+            from entities import parse_entity_registry  # type: ignore[no-redef]
         parse_entity_registry(defaults.get("entity_registry"))
     except ImportError:
         # entities.py missing on this checkout (e.g. running an older

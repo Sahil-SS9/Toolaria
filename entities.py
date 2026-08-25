@@ -39,7 +39,10 @@ import re
 import time
 from typing import Any
 
-from labels import VALID_LABELS
+try:
+    from .labels import VALID_LABELS
+except ImportError:
+    from labels import VALID_LABELS  # type: ignore[no-redef]
 
 logger = logging.getLogger(__name__)
 
