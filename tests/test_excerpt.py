@@ -65,3 +65,24 @@ def test_html_excerpt_keeps_structure():
     raw = "<!DOCTYPE html>\n<html>\n<body>\n" + "<!--pad-->\n" * 5000 + "</body>\n</html>"
     ex = build_excerpt(raw, "html", CFG)
     assert "<body>" in ex or "<html>" in ex
+
+
+def test_html_long_lines_capped_per_line():
+    # Regression: minified/long-line HTML produced a 60k+ char handle because
+    # head/tail lines were joined uncapped. Each line must respect the same
+    # 500-char cap used for anchor/error lines. Needs >hl+tl lines to take
+    # the head/tail path (the short-content path is budget-capped instead).
+    raw = "<html><body>\n" + "\n".join("<div>" + "x" * 20000 + "</div>" for _ in range(80)) + "\n</body></html>"
+    ex = build_excerpt(raw, "html", CFG)
+    for line in ex.splitlines():
+        assert len(line) <= 500, f"line exceeds cap: {len(line)}"
+
+
+def test_excerpt_hard_budget_enforced():
+    # Aggregate budget: many individually-capped lines can still sum past
+    # excerpt_max_chars; the assembled excerpt must be truncated.
+    body_line = "y" * 480
+    raw = "<html><body>\n" + "\n".join(f"<p>{body_line}</p>" for _ in range(80)) + "\n</body></html>"
+    ex = build_excerpt(raw, "html", dict(CFG, excerpt_max_chars=2000))
+    assert len(ex) <= 2400, f"excerpt blew budget: {len(ex)}"
+    assert "truncated to excerpt_max_chars" in ex

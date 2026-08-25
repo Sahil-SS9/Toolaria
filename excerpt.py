@@ -115,13 +115,18 @@ def build_excerpt(raw: str, kind: str, cfg: dict):
     # text / code / html
     kind_label = {"text": "text", "code": "code", "html": "HTML"}.get(kind, kind)
     parts = [f"[{kind_label} excerpt]"]
+    exc_cap = cfg.get("excerpt_max_chars", 8000)
+    # Per-line cap matching the anchor/error line treatment below: a single
+    # long line (minified HTML, one-line JSON dump) must not dominate or
+    # blow past the excerpt budget.
+    line_cap = 500
     if len(lines) <= hl + tl:
-        parts.append(raw[:cfg.get("excerpt_max_chars", 8000)])
+        parts.append(raw[:exc_cap])
     else:
         parts.append("--- head ---")
-        parts.append("\n".join(lines[:hl]))
+        parts.append("\n".join(l[:line_cap] for l in lines[:hl]))
         parts.append("--- tail ---")
-        parts.append("\n".join(lines[-tl:]))
+        parts.append("\n".join(l[:line_cap] for l in lines[-tl:]))
     # Error/decision/action/value lines — use anchor_patterns if present,
     # else legacy flat error_line_patterns for backward compatibility.
     if cfg.get("anchor_patterns"):
@@ -131,7 +136,14 @@ def build_excerpt(raw: str, kind: str, cfg: dict):
         if errs:
             parts.append("--- error lines ---")
             parts.extend(errs[:10])
-    return "\n".join(parts)
+    out = "\n".join(parts)
+    # Hard budget: the excerpt is what lands in the model's context on every
+    # rescue. Anchors and error sections are individually capped per line but
+    # not in aggregate; enforce excerpt_max_chars on the assembled result so
+    # no payload class can produce an oversized handle.
+    if len(out) > exc_cap:
+        out = out[:exc_cap] + "\n[... excerpt truncated to excerpt_max_chars]"
+    return out
 
 
 def _error_lines(lines, patterns):
