@@ -27,7 +27,7 @@ needs_crypto = pytest.mark.skipif(
 # both the plugin dir and its parent off sys.path. Naming the package
 # explicitly (rather than ``import <dirname>``) keeps this independent of
 # what the checkout directory happens to be called.
-_PRELUDE = [
+_PACKAGE_SETUP = [
     "import importlib",
     "import importlib.util",
     "import sys",
@@ -36,6 +36,9 @@ _PRELUDE = [
     f"init_path = Path({str(_PLUGIN_DIR / '__init__.py')!r})",
     f"blocked = {{{str(_PLUGIN_DIR)!r}, {str(_PACKAGE_PARENT)!r}}}",
     "sys.path = [p for p in sys.path if p not in blocked]",
+]
+
+_PACKAGE_LOAD = [
     "spec = importlib.util.spec_from_file_location(",
     "    'toolaria', init_path, submodule_search_locations=[str(plugin_dir)]",
     ")",
@@ -48,12 +51,15 @@ _PRELUDE = [
 ]
 
 
-def _run_in_package_mode(body, tmp_path):
-    """Run *body* in a subprocess with Toolaria loaded as a package."""
-    code = "\n".join(_PRELUDE + body)
-    env = os.environ.copy()
-    env.pop("PYTHONPATH", None)
-    env["HERMES_HOME"] = str(tmp_path / "hermes-home")
+def _run_in_package_mode(body, tmp_path, *, setup=(), expect_success=True):
+    """Run *body* in a bounded, minimal-env package subprocess."""
+    code = "\n".join(_PACKAGE_SETUP + list(setup) + _PACKAGE_LOAD + body)
+    env = {
+        "HOME": str(tmp_path / "home"),
+        "HERMES_HOME": str(tmp_path / "hermes-home"),
+        "PATH": os.environ.get("PATH", ""),
+        "PYTHONNOUSERSITE": "1",
+    }
 
     result = subprocess.run(
         [sys.executable, "-c", code],
@@ -61,9 +67,30 @@ def _run_in_package_mode(body, tmp_path):
         env=env,
         capture_output=True,
         text=True,
+        timeout=15,
     )
 
-    assert result.returncode == 0, result.stderr
+    if expect_success:
+        assert result.returncode == 0, result.stderr
+    return result
+
+
+def _write_conflicting_module(tmp_path, module_name):
+    (tmp_path / f"{module_name}.py").write_text(
+        f"raise AssertionError('conflicting top-level {module_name} imported')\n",
+        encoding="utf-8",
+    )
+
+
+def _block_package_module(module_name):
+    return [
+        "class _BlockRelativeImport:",
+        "    def find_spec(self, fullname, path=None, target=None):",
+        f"        if fullname == 'toolaria.{module_name}':",
+        "            raise ImportError('blocked internal relative import')",
+        "        return None",
+        "sys.meta_path.insert(0, _BlockRelativeImport())",
+    ]
 
 
 def test_package_import_without_plugin_dir_on_sys_path(tmp_path):
@@ -94,6 +121,58 @@ def test_package_import_without_plugin_dir_on_sys_path(tmp_path):
         "assert middleware(tool_name='summarise', args={},",
         "                  session_id='package-session') is None",
     ], tmp_path)
+
+
+def test_package_import_does_not_redirect_to_conflicting_top_level_module(tmp_path):
+    """A package import failure must not fall back to another checkout."""
+    _write_conflicting_module(tmp_path, "blobstore")
+    result = _run_in_package_mode(
+        [], tmp_path, setup=_block_package_module("blobstore"),
+        expect_success=False,
+    )
+    assert result.returncode != 0
+    assert "blocked internal relative import" in result.stderr
+    assert "conflicting top-level blobstore imported" not in result.stderr
+
+
+def test_lazy_package_import_error_is_not_redirected(tmp_path):
+    """Lazy package imports must surface internal errors, not loose siblings."""
+    _write_conflicting_module(tmp_path, "passref")
+    result = _run_in_package_mode(
+        [
+            "sys.modules.pop('toolaria.passref', None)",
+            "delattr(toolaria, 'passref') if hasattr(toolaria, 'passref') else None",
+            f"store = toolaria.BlobStore({{'store_path': {str(tmp_path / 'store')!r},",
+            "    'enforcement_enabled': True})",
+            "bid = store.put('credential data', 'send_email',",
+            "                 session_id='lazy-session', label='credential')",
+            "store.fetch(bid, 'full', session_id='lazy-session')",
+        ],
+        tmp_path,
+        setup=_block_package_module("passref"),
+        expect_success=False,
+    )
+    assert result.returncode != 0
+    assert "blocked internal relative import" in result.stderr
+    assert "conflicting top-level passref imported" not in result.stderr
+
+
+def test_merge_cfg_import_error_is_not_redirected(tmp_path):
+    """Config validation must surface blocked package imports, not redirect."""
+    _write_conflicting_module(tmp_path, "labels")
+    result = _run_in_package_mode(
+        [
+            "sys.modules.pop('toolaria.labels', None)",
+            "delattr(toolaria, 'labels') if hasattr(toolaria, 'labels') else None",
+            "toolaria._merge_cfg({})",
+        ],
+        tmp_path,
+        setup=_block_package_module("labels"),
+        expect_success=False,
+    )
+    assert result.returncode != 0
+    assert "blocked internal relative import" in result.stderr
+    assert "conflicting top-level labels imported" not in result.stderr
 
 
 @needs_crypto

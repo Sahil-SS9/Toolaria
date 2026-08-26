@@ -27,10 +27,10 @@ from __future__ import annotations
 import logging
 import re
 
-try:
+if __package__:
     from .ledger import log_expansion as _log_expansion
     from .ledger import log_entity_binding
-except ImportError:
+else:
     from ledger import log_expansion as _log_expansion  # type: ignore[no-redef]
     from ledger import log_entity_binding  # type: ignore[no-redef]
 
@@ -181,9 +181,9 @@ def _credential_enforcement_active(cfg: dict) -> bool:
     allowlist + enforcement on is a deny-all (every credential
     expansion refused), which is the safe default.
     ``_credential_destinations_allow`` is the per-destination check."""
-    try:
+    if __package__:
         from .blobstore import BlobStore
-    except ImportError:
+    else:
         from blobstore import BlobStore  # type: ignore[no-redef]
     return BlobStore._truthy(cfg.get("enforcement_enabled", False))
 
@@ -428,9 +428,9 @@ def _confirmation_required(cfg: dict) -> bool:
     actually disables the gate — same posture as
     ``_credential_enforcement_active``.
     """
-    try:
+    if __package__:
         from .blobstore import BlobStore
-    except ImportError:
+    else:
         from blobstore import BlobStore  # type: ignore[no-redef]
     return BlobStore._truthy(cfg.get("confirmation_required", False))
 
@@ -542,13 +542,13 @@ def make_middleware(get_store, cfg: dict, skip_tools: frozenset):
         # path is byte-identical to pre-T3 when the operator has not
         # opted in. The block sits BEFORE expansion so binding rows are
         # recorded in the ledger with the pre-expansion context.
-        try:
+        if __package__:
             from .entities import (
                 get_registry,
                 extract_entities,
                 distinct_entity_kinds,
             )
-        except ImportError:
+        else:
             from entities import (  # type: ignore[no-redef]
                 get_registry,
                 extract_entities,

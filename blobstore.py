@@ -16,7 +16,7 @@ except ImportError:  # pragma: no cover - non-POSIX fallback path
     fcntl = None  # type: ignore[assignment]
     _HAVE_FCNTL = False
 
-try:
+if __package__:
     from .excerpt import detect_type as _detect_type
     from .index import build_outline as _struct_outline
     from .index import render_outline as _render_outline
@@ -28,7 +28,7 @@ try:
     from .entities import (get_registry as _entity_registry,
                               extract_entities as _extract_entities,
                               distinct_entity_kinds as _distinct_entity_kinds)
-except ImportError:
+else:
     from excerpt import detect_type as _detect_type  # type: ignore[no-redef]
     from index import build_outline as _struct_outline  # type: ignore[no-redef]
     from index import render_outline as _render_outline  # type: ignore[no-redef]
@@ -865,9 +865,9 @@ class BlobStore:
 
         # 6. Ledger row.
         try:
-            try:
+            if __package__:
                 from .ledger import log_key_rotation
-            except ImportError:
+            else:
                 from ledger import log_key_rotation  # type: ignore[no-redef]
             log_key_rotation(
                 self.cfg, count=len(rotated),
@@ -1789,10 +1789,10 @@ class BlobStore:
             if blob_label is None:
                 blob_label = "credential"
             if blob_label == "credential":
-                try:
+                if __package__:
                     from .passref import (CREDENTIAL_REFUSE_MARKER_PREFIX,
                                           CREDENTIAL_REFUSE_MARKER_SUFFIX)
-                except ImportError:
+                else:
                     from passref import (  # type: ignore[no-redef]
                         CREDENTIAL_REFUSE_MARKER_PREFIX,
                         CREDENTIAL_REFUSE_MARKER_SUFFIX,

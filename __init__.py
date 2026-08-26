@@ -14,11 +14,11 @@ import os
 import time
 from pathlib import Path
 
-try:
+if __package__:
     from .blobstore import BlobStore, _BLOB_ID_RE
     from .excerpt import detect_type, build_excerpt
     from .passref import make_middleware as _make_passref_mw
-except ImportError:
+else:
     from blobstore import BlobStore, _BLOB_ID_RE  # type: ignore[no-redef]
     from excerpt import detect_type, build_excerpt  # type: ignore[no-redef]
     from passref import make_middleware as _make_passref_mw  # type: ignore[no-redef]
@@ -158,24 +158,25 @@ def _merge_cfg(user_cfg: dict) -> dict:
     # raises ValueError listing offending keys/values; we let that
     # bubble up to register() and abort plugin load so the operator
     # sees the typo before any rescue runs.
-    try:
+    if __package__:
         from .labels import _parse_tool_label_map
-    except ImportError:
+    else:
         from labels import _parse_tool_label_map  # type: ignore[no-redef]
     _parse_tool_label_map(defaults.get("sensitivity_tool_labels"))
     # T3.1: validate the entity_registry the same way so a broken
     # pattern/regex/sensitivity never silently disables the governor
     # or leaks into a half-broken put().
-    try:
-        try:
-            from .entities import parse_entity_registry
-        except ImportError:
-            from entities import parse_entity_registry  # type: ignore[no-redef]
+    if __package__:
+        from .entities import parse_entity_registry
         parse_entity_registry(defaults.get("entity_registry"))
-    except ImportError:
-        # entities.py missing on this checkout (e.g. running an older
-        # snapshot). Skip — the feature stays inert.
-        pass
+    else:
+        try:
+            from entities import parse_entity_registry  # type: ignore[no-redef]
+        except ModuleNotFoundError as exc:
+            if exc.name != "entities":
+                raise
+        else:
+            parse_entity_registry(defaults.get("entity_registry"))
     return defaults
 
 

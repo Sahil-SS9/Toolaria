@@ -39,9 +39,9 @@ import re
 import time
 from typing import Any
 
-try:
+if __package__:
     from .labels import VALID_LABELS
-except ImportError:
+else:
     from labels import VALID_LABELS  # type: ignore[no-redef]
 
 logger = logging.getLogger(__name__)
