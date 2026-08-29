@@ -4,7 +4,7 @@ toolaria:
   max_result_chars: 12000         # rescue results larger than this
   fetch_max_chars: 4000           # cap on range/grep responses
   full_fetch_max_chars: 50000     # full mode refused above this (see refuse_full_fetch)
-  excerpt_max_chars: 8000         # cap on short-content excerpts
+  excerpt_max_chars: 8000         # EXACT cap on the excerpt block incl. marker (min 200; see README)
   head_lines: 40
   tail_lines: 15
   json_head_items: 5
