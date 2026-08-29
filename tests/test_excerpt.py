@@ -78,11 +78,85 @@ def test_html_long_lines_capped_per_line():
         assert len(line) <= 500, f"line exceeds cap: {len(line)}"
 
 
-def test_excerpt_hard_budget_enforced():
-    # Aggregate budget: many individually-capped lines can still sum past
-    # excerpt_max_chars; the assembled excerpt must be truncated.
-    body_line = "y" * 480
-    raw = "<html><body>\n" + "\n".join(f"<p>{body_line}</p>" for _ in range(80)) + "\n</body></html>"
-    ex = build_excerpt(raw, "html", dict(CFG, excerpt_max_chars=2000))
-    assert len(ex) <= 2400, f"excerpt blew budget: {len(ex)}"
-    assert "truncated to excerpt_max_chars" in ex
+# ---------------------------------------------------------------------------
+# Exact-budget contract (2026-08-29 takeover): excerpt_max_chars is an EXACT
+# cap on the assembled excerpt including the truncation marker; one shared
+# seam for every payload kind; marker counts inside the cap; tail and
+# promoted anchors survive truncation; preview description stays honest.
+
+
+def _oversized_html(n_lines=200, line_len=480):
+    body = "y" * line_len
+    return "<html><body>\n" + "\n".join(f"<p>{body}</p>" for _ in range(n_lines)) + "\n</body></html>"
+
+
+def test_excerpt_exact_budget_html():
+    raw = _oversized_html()
+    for cap in (200, 2_000, 8_000):
+        ex = build_excerpt(raw, "html", dict(CFG, excerpt_max_chars=cap))
+        assert len(ex) <= cap, f"cap {cap}: excerpt blew budget: {len(ex)}"
+        if ex.endswith("[... excerpt truncated to excerpt_max_chars]"):
+            assert len(ex) > cap - 100, (
+                f"cap {cap}: truncated excerpt wastes budget: {len(ex)}")
+
+
+def test_excerpt_exact_budget_json_with_large_values():
+    # Regression: the JSON path returned early and bypassed any cap —
+    # a 200k-char JSON produced a 140k-char excerpt (2026-08-26 review).
+    raw = '{"k": "' + "z" * 500_000 + '"}'
+    for cap in (2_000, 8_000):
+        ex = build_excerpt(raw, "json", dict(CFG, excerpt_max_chars=cap))
+        assert len(ex) <= cap, f"cap {cap}: JSON excerpt blew budget: {len(ex)}"
+
+
+def test_excerpt_exact_budget_json_array():
+    raw = json.dumps(["z" * 30_000] * 40)
+    ex = build_excerpt(raw, "json", dict(CFG, excerpt_max_chars=3_000))
+    assert len(ex) <= 3_000, f"JSON array excerpt blew budget: {len(ex)}"
+
+
+def test_excerpt_exact_budget_text_short_content_path():
+    # <= head+tail lines rides the raw-passthrough branch; it must be
+    # budget-exact too.
+    raw = "w" * 100_000
+    ex = build_excerpt(raw, "text", dict(CFG, excerpt_max_chars=1_500))
+    assert len(ex) <= 1_500, f"text short-path blew budget: {len(ex)}"
+
+
+def test_truncation_marker_counts_inside_cap():
+    for cap in (200, 2_000):
+        ex = build_excerpt(_oversized_html(), "html", dict(CFG, excerpt_max_chars=cap))
+        assert ex.endswith("[... excerpt truncated to excerpt_max_chars]"), ex[-80:]
+        assert len(ex) <= cap
+
+
+def test_tiny_and_invalid_caps_degrade_safely():
+    raw = _oversized_html()
+    # Below-minimum caps clamp to the minimum (200) — never zero-length.
+    for bad in (0, -5, 10, 199):
+        ex = build_excerpt(raw, "html", dict(CFG, excerpt_max_chars=bad))
+        assert len(ex) <= 200, f"cap {bad}: len {len(ex)}"
+        assert ex, f"cap {bad}: empty excerpt"
+    # Malformed values fall back to the default cap path, not a crash.
+    ex = build_excerpt(raw, "html", dict(CFG, excerpt_max_chars="oops"))
+    assert len(ex) <= 8_000
+
+
+def test_tail_survives_truncation():
+    # A fat head must not push the tail out of the output (2026-08-26
+    # finding: prefix slicing deleted the tail while claiming it existed).
+    fat_line = "h" * 480
+    raw = ("<html><body>\n" + "\n".join(fat_line for _ in range(120))
+           + "\nUNIQUE-TAIL-SENTINEL-9f3a\n</body></html>")
+    ex = build_excerpt(raw, "html", dict(CFG, excerpt_max_chars=2_000))
+    assert "UNIQUE-TAIL-SENTINEL-9f3a" in ex, "tail lost under truncation"
+
+
+def test_promoted_anchors_survive_truncation():
+    fat_line = "q" * 480
+    raw = ("\n".join(fat_line for _ in range(120))
+           + "\nFATAL: disk full on /var\n" + "\n".join(fat_line for _ in range(120)))
+    cfg = dict(CFG, excerpt_max_chars=1_500,
+               anchor_patterns={"error": ["FATAL"]})
+    ex = build_excerpt(raw, "html", cfg)
+    assert "FATAL: disk full on /var" in ex, "promoted anchor lost under truncation"

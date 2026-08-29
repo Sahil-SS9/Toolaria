@@ -177,7 +177,7 @@ All keys in `config.yaml` with defaults:
 | `max_result_chars` | `12000` | Minimum result size to trigger rescue |
 | `fetch_max_chars` | `4000` | Cap on `range`/`grep` response size |
 | `full_fetch_max_chars` | `50000` | `full` mode refused above this when `refuse_full_fetch` |
-| `excerpt_max_chars` | `8000` | Cap on short-content excerpts |
+| `excerpt_max_chars` | `8000` | **Exact** cap on the excerpt block, incl. its truncation marker (min 200) |
 | `store_path` | `~/.hermes/toolaria` | Blob and session index directory |
 | `ttl_hours` | `72` | Auto-sweep blobs older than this |
 | `tombstone_ttl_hours` | `720` | Keep swept-blob guidance this long |
@@ -203,6 +203,22 @@ All keys in `config.yaml` with defaults:
 | `passref_allowed_tools` | `[]` | Strict allowlist; empty means all but exec/exfil sinks |
 | `toolaria_key_file` | *(unset)* | Path to a Fernet key file for credential-tier encryption (see below) |
 | `sensitivity_tool_labels` | `{}` | `{tool_name: label}` overrides for the built-in tool→label map |
+
+### Excerpt budget contract
+
+`excerpt_max_chars` is an **exact cap** on the excerpt block that lands in
+the rescue handle — for every payload kind (JSON, HTML, code, text), the
+assembled excerpt including its truncation marker is never longer than the
+configured limit. Minimum 200; smaller values (and malformed values at
+runtime) clamp to the minimum/default, and a non-integer or sub-minimum
+value fails loudly at plugin registration. When the budget binds, space is
+allocated by priority — promoted error/decision anchors (40%) ≥ head (40%)
+≥ tail (20%), renormalised over the sections actually present — so a fat
+head can no longer push the tail or a fatal-error line out of the preview.
+A truncated excerpt ends with `[... excerpt truncated to
+excerpt_max_chars]` and the handle's preview line switches from
+"first N / last M lines" to "budget C chars, truncated" so the description
+never claims sections the excerpt does not carry.
 
 ---
 
@@ -339,6 +355,12 @@ per-call size caps bound how much content one tool call can pull in.
 - **Fetch is a capability model.** Any caller that knows a 12-hex blob id can
   fetch it; ids are content-derived and only revealed in the rescuing session's
   handle. Swept-blob guidance is scoped to the owning session.
+
+## Contributors
+
+- [Dr-Amp](https://github.com/Dr-Amp) — session-scoped blob fetch ([PR #1](https://github.com/Sahil-SS9/Toolaria/pull/1))
+- [Gerkinfeltser](https://github.com/Gerkinfeltser) — package-style plugin imports ([PR #2](https://github.com/Sahil-SS9/Toolaria/pull/2))
+- [Lincoln Vann-Wakelin (Masterlincs)](https://github.com/Masterlincs) — excerpt budget enforcement ([PR #4](https://github.com/Sahil-SS9/Toolaria/pull/4)/[#5](https://github.com/Sahil-SS9/Toolaria/pull/5))
 
 ## License
 

@@ -16,11 +16,11 @@ from pathlib import Path
 
 if __package__:
     from .blobstore import BlobStore, _BLOB_ID_RE
-    from .excerpt import detect_type, build_excerpt
+    from .excerpt import detect_type, build_excerpt, build_excerpt_meta
     from .passref import make_middleware as _make_passref_mw
 else:
     from blobstore import BlobStore, _BLOB_ID_RE  # type: ignore[no-redef]
-    from excerpt import detect_type, build_excerpt  # type: ignore[no-redef]
+    from excerpt import detect_type, build_excerpt, build_excerpt_meta  # type: ignore[no-redef]
     from passref import make_middleware as _make_passref_mw  # type: ignore[no-redef]
 
 logger = logging.getLogger(__name__)
@@ -158,6 +158,14 @@ def _merge_cfg(user_cfg: dict) -> dict:
     # raises ValueError listing offending keys/values; we let that
     # bubble up to register() and abort plugin load so the operator
     # sees the typo before any rescue runs.
+    # Exact-budget contract (2026-08-29): validate excerpt_max_chars at
+    # register time so a bad operator config fails LOUD at load rather
+    # than silently clamping at rescue time.
+    _exc = defaults.get("excerpt_max_chars", 8000)
+    if not isinstance(_exc, int) or isinstance(_exc, bool) or _exc < 200:
+        raise ValueError(
+            f"excerpt_max_chars must be an integer >= 200, got {_exc!r}"
+        )
     if __package__:
         from .labels import _parse_tool_label_map
     else:
@@ -564,7 +572,7 @@ def _rescue(result: str, tool_name: str, args: dict | None = None,
         return None
 
     kind, meta = detect_type(result)
-    excerpt = build_excerpt(result, kind, _cfg)
+    excerpt, exc_meta = build_excerpt_meta(result, kind, _cfg)
     # Structural outline is cheap and deterministic; build it now so the
     # model can navigate by structure on its first fetch.
     # Reviewer fix 1 (2026-08-25): sidecar suppression now lives inside
@@ -624,10 +632,22 @@ def _rescue(result: str, tool_name: str, args: dict | None = None,
             f"Retrieve the full result with rescuer_fetch(id=\"{blob_id}\", "
             f"mode=\"full\") or fetch slices with mode=range/grep/outline."
         )
+    # Honest preview description: when the exact budget truncated the
+    # excerpt, say so — the handle must never claim sections it does not
+    # actually carry (reviewer contract, 2026-08-29).
+    if exc_meta["truncated"]:
+        preview_line = (
+            f"Preview (budget {exc_meta['cap']} chars, truncated); "
+            f"this is a preview, NOT the full output:"
+        )
+    else:
+        preview_line = (
+            f"Preview (first {head_lines} / last {tail_lines} lines); "
+            f"this is a preview, NOT the full output:"
+        )
     return (
         f"{header}\n"
-        f"Preview (first {head_lines} / last {tail_lines} lines); "
-        f"this is a preview, NOT the full output:\n"
+        f"{preview_line}\n"
         f"{excerpt}\n"
         f"Retrieve more with rescuer_fetch(id=\"{blob_id}\", mode=...):\n"
         f"  outline  structural map (sections / JSON schema / error clusters)\n"
