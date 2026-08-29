@@ -16,19 +16,19 @@ except ImportError:  # pragma: no cover - non-POSIX fallback path
     fcntl = None  # type: ignore[assignment]
     _HAVE_FCNTL = False
 
-try:
+if __package__:
     from .excerpt import detect_type as _detect_type
     from .index import build_outline as _struct_outline
     from .index import render_outline as _render_outline
     from .chunking import chunk_lines as _chunk_lines
     from . import semantic as _sem
-    from labels import (label_for_tool, label_for_args as _label_for_args,
+    from .labels import (label_for_tool, label_for_args as _label_for_args,
                               VALID_LABELS, _LABEL_UPGRADE_PATTERNS,
                               _BUILTIN_TOOL_LABELS)
-    from entities import (get_registry as _entity_registry,
+    from .entities import (get_registry as _entity_registry,
                               extract_entities as _extract_entities,
                               distinct_entity_kinds as _distinct_entity_kinds)
-except ImportError:
+else:
     from excerpt import detect_type as _detect_type  # type: ignore[no-redef]
     from index import build_outline as _struct_outline  # type: ignore[no-redef]
     from index import render_outline as _render_outline  # type: ignore[no-redef]
@@ -865,7 +865,10 @@ class BlobStore:
 
         # 6. Ledger row.
         try:
-            from ledger import log_key_rotation
+            if __package__:
+                from .ledger import log_key_rotation
+            else:
+                from ledger import log_key_rotation  # type: ignore[no-redef]
             log_key_rotation(
                 self.cfg, count=len(rotated),
                 old_key_file=str(old_path_p),
@@ -1786,8 +1789,14 @@ class BlobStore:
             if blob_label is None:
                 blob_label = "credential"
             if blob_label == "credential":
-                from passref import (CREDENTIAL_REFUSE_MARKER_PREFIX,
-                                     CREDENTIAL_REFUSE_MARKER_SUFFIX)
+                if __package__:
+                    from .passref import (CREDENTIAL_REFUSE_MARKER_PREFIX,
+                                          CREDENTIAL_REFUSE_MARKER_SUFFIX)
+                else:
+                    from passref import (  # type: ignore[no-redef]
+                        CREDENTIAL_REFUSE_MARKER_PREFIX,
+                        CREDENTIAL_REFUSE_MARKER_SUFFIX,
+                    )
                 return (f"{CREDENTIAL_REFUSE_MARKER_PREFIX}{blob_id}"
                         f"{CREDENTIAL_REFUSE_MARKER_SUFFIX}")
 
