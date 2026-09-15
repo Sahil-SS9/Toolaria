@@ -9,6 +9,17 @@ Explicit allow-list enforced; only rescued tools get intercepted.
 """
 from __future__ import annotations
 
+# KENSEI plugin-path bootstrap 2026-09-15: sibling modules use absolute imports
+# (e.g. blobstore.py: `from labels import ...`) which require this directory on
+# sys.path. Some Hermes host loaders import directory plugins as
+# hermes_plugins.<slug> packages without adding the dir to sys.path, so ensure
+# it here. Idempotent.
+import os as _os, sys as _sys
+
+_PLUGIN_DIR = _os.path.dirname(_os.path.abspath(__file__))
+if _PLUGIN_DIR not in _sys.path:
+    _sys.path.insert(0, _PLUGIN_DIR)
+
 import logging
 import os
 import time
