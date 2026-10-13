@@ -36,7 +36,8 @@ A real `web_extract` returning 2,000 transaction records, run through Toolaria:
 | Model hands the result to a second tool | must read all 171,874 chars back in to pass them on | emits **79 chars** (`tla:<id>`); the tool receives the full 171,874 |
 | Model needs the failed payments | scroll/grep blind through 171k chars | `outline` then `search "failed"` returns the matching rows with line numbers |
 
-What the model actually sees when the result lands (truncated):
+An example rescue handle (captured before derived JSON navigation; current
+handles count navigation lines rather than the raw JSON wrapper):
 
 ```
 [Toolaria: tool result rescued. tool=web_extract; size=171,874 chars; lines=1; type=json array[2000]; blob=5ddff67d]
@@ -204,6 +205,25 @@ All keys in `config.yaml` with defaults:
 | `toolaria_key_file` | *(unset)* | Path to a Fernet key file for credential-tier encryption (see below) |
 | `sensitivity_tool_labels` | `{}` | `{tool_name: label}` overrides for the built-in tool→label map |
 
+### Shared-store cleanup
+
+On POSIX systems, a private `.store.lock` serialises cleanup with blob/index
+publication and metadata updates across processes. A sweep cannot delete a
+blob between its byte write and session-reference save, or use a stale live
+reference snapshot while another process adopts it. The lock is re-entrant
+within a thread and released automatically when an operation or process exits.
+Do not remove the lock file while the store is in use.
+
+TTL cleanup collects live references in one index pass. Size-cap eviction
+updates references in a batch, instead of rereading every index for every
+removed blob. Already-removed files are harmless, and a failed initial sweep
+is logged without disabling an otherwise usable store.
+
+Upgrade and restart **all processes sharing a `store_path`** together: older
+clients do not participate in this advisory lock. Use a local filesystem with
+working POSIX `flock` semantics. Where POSIX locking is unavailable, Toolaria
+logs a warning and coordinates threads only; use one process per store.
+
 ### Excerpt budget contract
 
 `excerpt_max_chars` is an **exact cap** on the excerpt block that lands in
@@ -291,6 +311,30 @@ The model-facing tool to retrieve slices of a rescued result.
 | `grep` | `id`, `pattern` | Regex match within the blob, with line numbers |
 | `chain` | `id`, `pattern`, `count` | Composite: grep for `pattern` then return `count` lines of context around each match |
 | `full` | `id` | Full content (refused over `full_fetch_max_chars` by default) |
+
+### JSON and MCP navigation
+
+`range`, `grep`, `chain`, `search`, `outline` and the inline preview use the
+same derived line view. For a named MCP tool (`mcp_…`), an envelope containing
+**only** a string-valued `result` field is decoded once. Single-line JSON
+objects/arrays are then formatted with line breaks, preserving every JSON
+token: number spellings, duplicate keys, string escapes and order are not
+rewritten. Existing multi-line content keeps its line coordinates. Envelopes
+with extra metadata and arbitrary non-MCP `result` fields are not unwrapped.
+
+A derived response identifies its view and line count. Use its zero-based
+line numbers for follow-up `range` calls. `lines` in the rescue header is the
+navigation line count; `size` still describes the original result. Very large
+individual string values remain subject to the existing per-line scan and
+response caps. Invalid or excessively deep JSON falls back to its original
+representation rather than being repaired or guessed.
+
+The original bytes, content ID, integrity hash, `stat` size, `full` response
+and `tla:` expansion stay unchanged. Old outline/chunk caches are rebuilt on
+first use; embeddings are tied to the actual chunks, not merely their count.
+Credential masking happens before previews, summaries and snippet truncation,
+and encrypted blobs never acquire plaintext navigation sidecars. No blob
+migration or cache deletion by the operator is required.
 
 If a blob has been swept after its retention window, `rescuer_fetch` returns a
 short message naming the source tool and advising the model to re-run it, rather
