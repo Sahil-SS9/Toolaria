@@ -65,8 +65,11 @@ def test_sidecar_file_is_0600_under_umask0(fresh_cfg):
     old = os.umask(0)
     try:
         bs = BlobStore(fresh_cfg)
-        bs.write_sidecar("abcdef012345", "outline", {"x": 1})
-        path = bs.sidecar_dir / "abcdef012345.outline.json"
+        # Cache publication now requires a live, readable backing blob;
+        # keep the original umask/0600 permission assertion unchanged.
+        bid = bs.put("public backing content", "web_search", session_id="sidecar-owner")
+        bs.write_sidecar(bid, "outline", {"x": 1})
+        path = bs.sidecar_dir / f"{bid}.outline.json"
         mode = path.stat().st_mode & 0o777
         assert mode == 0o600, f"sidecar file mode {oct(mode)}, expected 0o600"
     finally:

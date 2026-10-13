@@ -586,8 +586,11 @@ def _rescue(result: str, tool_name: str, args: dict | None = None,
         logger.warning("toolaria: blob write failed for %s: %s", tool_name, exc)
         return None
 
-    kind, meta = detect_type(result)
-    excerpt, exc_meta = build_excerpt_meta(result, kind, _cfg)
+    mask_slices = (_store._enforcement_enabled()
+                   and _store._max_label_for_blob(blob_id) == "credential")
+    view = _store.navigation_view(blob_id, result, session_id, mask_slices=mask_slices)
+    kind, meta = detect_type(view.text)
+    excerpt, exc_meta = build_excerpt_meta(view.text, kind, _cfg)
     # Structural outline is cheap and deterministic; build it now so the
     # model can navigate by structure on its first fetch.
     # Reviewer fix 1 (2026-08-25): sidecar suppression now lives inside
@@ -604,10 +607,11 @@ def _rescue(result: str, tool_name: str, args: dict | None = None,
             )
             _store.delete_sidecars(blob_id)
         else:
-            _store.build_outline(blob_id, result)
+            _store.build_outline(blob_id, result, session_id=session_id,
+                                 mask_slices=mask_slices)
     except Exception as exc:
         logger.debug("toolaria: outline build failed for %s: %s", blob_id, exc)
-    n_lines = result.count("\n") + 1
+    n_lines = view.line_count
     head_lines = _cfg.get("head_lines", 40)
     tail_lines = _cfg.get("tail_lines", 15)
     # Provenance: source URL + timestamp.
@@ -629,6 +633,7 @@ def _rescue(result: str, tool_name: str, args: dict | None = None,
         f"role={role}",
         f"size={len(result):,} chars",
         f"lines={n_lines:,}",
+        *([f"view={view.kind}"] if view.kind != "raw" else []),
         f"type={kind} {meta}",
         f"blob={blob_id}",
     ]

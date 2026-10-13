@@ -22,6 +22,7 @@ if __package__:
     from .excerpt import detect_type as _detect_type
     from .index import build_outline as _struct_outline
     from .index import render_outline as _render_outline
+    from .navigation import NavigationView, navigation_view as _navigation_view
     from .chunking import chunk_lines as _chunk_lines
     from . import semantic as _sem
     from .labels import (label_for_tool, label_for_args as _label_for_args,
@@ -34,6 +35,7 @@ else:
     from excerpt import detect_type as _detect_type  # type: ignore[no-redef]
     from index import build_outline as _struct_outline  # type: ignore[no-redef]
     from index import render_outline as _render_outline  # type: ignore[no-redef]
+    from navigation import NavigationView, navigation_view as _navigation_view  # type: ignore[no-redef]
     from chunking import chunk_lines as _chunk_lines  # type: ignore[no-redef]
     import semantic as _sem  # type: ignore[no-redef]
     from labels import (label_for_tool, label_for_args as _label_for_args,  # type: ignore[no-redef]
@@ -66,9 +68,9 @@ VERSION_NOT_FOUND_MARKER_SUFFIX = "]"
 # cap so post-mask re-capping still fills the budget. (Correctness agent:
 # named once — the two call sites must not drift.)
 _MASK_OVERFETCH_FACTOR = 4
-# Scan window when testing a line against credential-shape patterns.
-# (Clarity agent: was hardcoded [:2000] in three places; one constant.)
-_MASK_LINE_SCAN_LEN = 2000
+# Credential-shape checks use fixed, linear patterns on the whole line.
+# Query regexes retain their separate per-line/time caps; limiting the
+# security scan to a prefix would expose secrets later in long JSON values.
 _SLICE_BUDGET_MARKER_PREFIX = (
     "[Toolaria: credential slice budget exhausted for "
 )
@@ -1026,6 +1028,11 @@ class BlobStore:
         p = self.sidecar_path(blob_id, suffix)
         if p is None:
             return
+        # Check inside the shared store lock, not just before expensive
+        # embedding/index work. A concurrent encryption upgrade may have
+        # invalidated that earlier decision while the cache was computed.
+        if self._sidecars_forbidden(blob_id):
+            return
         # Prefix the temp with the blob id so an orphan from a crash between
         # mkstemp and replace is still caught by delete_sidecars' glob.
         fd, tmp = tempfile.mkstemp(dir=p.parent, prefix=f"{blob_id}.tmp", suffix=".json")
@@ -1085,8 +1092,21 @@ class BlobStore:
         except UnicodeDecodeError:
             return None
 
+    def navigation_view(self, blob_id: str, text: str, session_id: str = "",
+                        *, mask_slices: bool = False) -> NavigationView:
+        """One navigation representation shared by rescue and every slice mode."""
+        meta = self._find_meta(blob_id, session_id)
+        view = _navigation_view(text, meta.get("tool", ""))
+        if mask_slices:
+            # Mask before summaries/snippet truncation: truncating first can
+            # destroy the pattern and expose a partial credential.
+            return NavigationView("\n".join(self._mask_lines(view.text.splitlines())),
+                                  view.kind)
+        return view
+
     @_store_operation
-    def build_outline(self, blob_id: str, text: str) -> dict:
+    def build_outline(self, blob_id: str, text: str, *, session_id: str = "",
+                      mask_slices: bool = False) -> dict:
         """Build and cache the structural outline for a blob (cheap, sync).
         Safe to call at rescue time.
 
@@ -1095,8 +1115,11 @@ class BlobStore:
         and returned so the caller's response shape is unchanged; only
         the disk cache is suppressed.
         """
-        kind, _ = _detect_type(text)
-        outline = _struct_outline(text, kind, self.cfg)
+        view = self.navigation_view(blob_id, text, session_id, mask_slices=mask_slices)
+        kind, _ = _detect_type(view.text)
+        outline = _struct_outline(view.text, kind, self.cfg)
+        outline["navigation"] = view.key
+        outline["total_lines"] = view.line_count
         if not self._sidecars_forbidden(blob_id):
             self.write_sidecar(blob_id, "outline", outline)
         return outline
@@ -1120,23 +1143,22 @@ class BlobStore:
             # to cache it. Unknown disk state must suppress the write.
             return True
 
-    def _outline(self, blob_id: str, text: str) -> str:
-        cached = self.read_sidecar(blob_id, "outline")
-        if cached is None and not self._sidecars_forbidden(blob_id):
-            cached = self.build_outline(blob_id, text)
-            if cached is None:
-                cached = {}
-        if not cached:
-            # No cache available (encrypted blob): compute without
-            # writing. Same output as before, nothing hits disk.
-            kind, _ = _detect_type(text)
-            return _render_outline(_struct_outline(text, kind, self.cfg))
+    def _outline(self, blob_id: str, text: str, session_id: str = "",
+                 *, mask_slices: bool = False) -> str:
+        view = self.navigation_view(blob_id, text, session_id, mask_slices=mask_slices)
+        cached = None if self._sidecars_forbidden(blob_id) \
+            else self.read_sidecar(blob_id, "outline")
+        if not cached or cached.get("navigation") != view.key:
+            # build_outline also handles encrypted blobs without caching.
+            cached = self.build_outline(blob_id, text, session_id=session_id,
+                                        mask_slices=mask_slices)
         return _render_outline(cached)
 
     # ── semantic search ──
 
     @_store_operation
-    def _chunks(self, blob_id: str, text: str) -> tuple[list[dict], bool]:
+    def _chunks(self, blob_id: str, text: str, *, session_id: str = "",
+                mask_slices: bool = False) -> tuple[list[dict], bool]:
         """Line-aligned chunks for a blob, cached as a sidecar.
         Returns (chunks, truncated) where truncated means the blob was larger
         than search_max_chunks chunks and only the head was indexed.
@@ -1144,18 +1166,21 @@ class BlobStore:
         Reviewer fix 1: encrypted blobs compute chunks fresh each time
         (no plaintext .chunks.json sidecar is ever written).
         """
-        cached = None if self._sidecars_forbidden(blob_id) \
-            else self.read_sidecar(blob_id, "chunks")
-        if cached is not None:
-            return cached.get("chunks", []), cached.get("truncated", False)
+        view = self.navigation_view(blob_id, text, session_id, mask_slices=mask_slices)
         target = self.cfg.get("search_chunk_chars", 1200)
         overlap = self.cfg.get("search_chunk_overlap_lines", 2)
         max_chunks = self.cfg.get("search_max_chunks", 400)
+        params = [target, overlap, max_chunks]
+        cached = None if self._sidecars_forbidden(blob_id) \
+            else self.read_sidecar(blob_id, "chunks")
+        if (cached is not None and cached.get("navigation") == view.key
+                and cached.get("params") == params):
+            return cached.get("chunks", []), cached.get("truncated", False)
         # Cap per-chunk text so a single huge line cannot hand a giant string
         # to the embedder; range/grep still reach the full line in the blob.
         text_cap = target * 4
         chunks = []
-        for c in _chunk_lines(text, target, overlap):
+        for c in _chunk_lines(view.text, target, overlap):
             d = c.as_dict()
             d["text"] = d["text"][:text_cap]
             chunks.append(d)
@@ -1163,7 +1188,8 @@ class BlobStore:
         chunks = chunks[:max_chunks]
         if not self._sidecars_forbidden(blob_id):
             self.write_sidecar(blob_id, "chunks",
-                               {"chunks": chunks, "truncated": truncated})
+                               {"chunks": chunks, "truncated": truncated,
+                                "navigation": view.key, "params": params})
         return chunks, truncated
 
     def _chunk_vectors(self, blob_id: str, chunks: list[dict],
@@ -1177,8 +1203,11 @@ class BlobStore:
         if not _sem.embeddings_available():
             return None
         forbidden = self._sidecars_forbidden(blob_id)
+        chunks_hash = hashlib.sha256(json.dumps(
+            chunks, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()
         cached = None if forbidden else self.read_sidecar(blob_id, "vectors")
         if cached and cached.get("model") == model_name \
+                and cached.get("chunks_hash") == chunks_hash \
                 and len(cached.get("vectors", [])) == len(chunks):
             return cached["vectors"]
         vectors = _sem.embed([c["text"] for c in chunks], model_name)
@@ -1186,13 +1215,16 @@ class BlobStore:
             return None
         if not forbidden:
             self.write_sidecar(blob_id, "vectors",
-                               {"model": model_name, "vectors": vectors})
+                               {"model": model_name, "vectors": vectors,
+                                "chunks_hash": chunks_hash})
         return vectors
 
-    def search(self, blob_id: str, query: str, text: str) -> str:
+    def search(self, blob_id: str, query: str, text: str, *, session_id: str = "",
+               mask_slices: bool = False) -> str:
         if not query:
             return "Error: search requires query=..."
-        chunks, truncated = self._chunks(blob_id, text)
+        chunks, truncated = self._chunks(blob_id, text, session_id=session_id,
+                                         mask_slices=mask_slices)
         if not chunks:
             return "[search: blob is empty]"
         top_k = int(self.cfg.get("search_top_k", 5))
@@ -1951,8 +1983,17 @@ class BlobStore:
         except UnicodeDecodeError:
             return f"Error: blob {blob_id} is binary ({len(raw)} bytes)"
 
-        if mode == "outline":
-            return self._outline(blob_id, text)
+        if mode == "full":
+            max_full = self.cfg.get("full_fetch_max_chars", 50000)
+            if self.cfg.get("refuse_full_fetch", True) and len(text) > max_full:
+                return (
+                    f"Refused: blob is {len(text):,} chars, over the "
+                    f"{max_full:,} char full-fetch limit. "
+                    f"Use mode='range' or mode='grep' instead."
+                )
+            return text
+
+        view = self.navigation_view(blob_id, text, session_id)
 
         # Phase 3 FIX-2: under enforcement ON + credential label, slices
         # (range/grep/search/chain) must MASK credential-shaped lines so
@@ -1964,11 +2005,16 @@ class BlobStore:
         mask_slices = (self._enforcement_enabled()
                         and self._max_label_for_blob(blob_id) == "credential")
 
+        if mode == "outline":
+            return view.notice + self._outline(blob_id, text, session_id,
+                                               mask_slices=mask_slices)
+
         if mode == "search":
             # Phase 3 FIX-2: under enforcement + credential, mask the
             # snippets too. The search output is post-filtered for any
             # line that triggers a credential-shape pattern.
-            result = self.search(blob_id, query or "", text)
+            result = self.search(blob_id, query or "", text, session_id=session_id,
+                                 mask_slices=mask_slices)
             if mask_slices:
                 masked_lines = self._mask_lines(result.splitlines())
                 result = "\n".join(masked_lines)
@@ -1980,22 +2026,12 @@ class BlobStore:
                 )
             except _SliceBudgetExceeded as exc:
                 return exc.marker
-            return result
+            return view.notice + result
 
-        if mode == "full":
-            max_full = self.cfg.get("full_fetch_max_chars", 50000)
-            if self.cfg.get("refuse_full_fetch", True) and len(text) > max_full:
-                return (
-                    f"Refused: blob is {len(text):,} chars, over the "
-                    f"{max_full:,} char full-fetch limit. "
-                    f"Use mode='range' or mode='grep' instead."
-                )
-            return text
-
-        lines = text.splitlines()
+        lines = view.text.splitlines()
 
         try:
-            return self._dispatch_slice(
+            return view.notice + self._dispatch_slice(
                 mode, blob_id, session_id, lines, start, count, pattern, cap,
                 mask_slices=mask_slices,
             )
@@ -2052,8 +2088,7 @@ class BlobStore:
         pattern with the structural mask marker; preserve line count."""
         out = []
         for ln in lines:
-            text = (ln[:_MASK_LINE_SCAN_LEN]
-                    if isinstance(ln, str) else "")
+            text = ln if isinstance(ln, str) else ""
             if any(p.search(text) for p in _LABEL_UPGRADE_PATTERNS):
                 out.append(_SLICE_MASK_MARKER)
             else:
@@ -2071,13 +2106,10 @@ class BlobStore:
         to 500 chars before the post-filter runs. A credential shape
         that appears past position 500 of a long line was therefore
         NOT visible to the mask check, so the truncated 500-char body
-        leaked unmasked under enforcement ON. Range mode (which scans
-        ``line[:_MASK_LINE_SCAN_LEN]``) masked the same line. The fix:
-        after parsing the line-number ``n`` from a grep output line,
-        run the upgrade-pattern check against the ORIGINAL full line
-        ``lines[int(n)][:_MASK_LINE_SCAN_LEN]`` instead of the
-        truncated body. Output shape / line-number prefixes are
-        unchanged for non-matching lines.
+        leaked unmasked under enforcement ON. After parsing the
+        line-number ``n`` from a grep output line, check the ORIGINAL
+        full line ``lines[int(n)]`` rather than the truncated body. Output
+        shape / line-number prefixes are unchanged for non-matching lines.
         """
         if not mask_lines:
             return self._grep_safe(lines, pattern, cap), 0
@@ -2092,9 +2124,7 @@ class BlobStore:
             # lack that shape and pass through verbatim.
             head, sep, body = ln.partition(": ")
             if sep and head.isdigit():
-                # RISKY-1: check the ORIGINAL full line up to the
-                # mask scan window, not the truncated body that
-                # _grep_safe already capped at 500 chars.
+                # Check the original line, not _grep_safe's capped body.
                 idx = int(head)
                 if 0 <= idx < len(lines):
                     original = lines[idx]
@@ -2103,8 +2133,7 @@ class BlobStore:
                     # falls back to the truncated body so we never
                     # raise from the mask pass.
                     original = body
-                scan = (original[:_MASK_LINE_SCAN_LEN]
-                        if isinstance(original, str) else "")
+                scan = original if isinstance(original, str) else ""
                 if any(p.search(scan) for p in _LABEL_UPGRADE_PATTERNS):
                     out_lines.append(f"{head}: {_SLICE_MASK_MARKER}")
                     continue
@@ -2122,8 +2151,7 @@ class BlobStore:
                           cap * _MASK_OVERFETCH_FACTOR)
         out_lines: list = []
         for ln in raw.splitlines():
-            if any(p.search(ln[:_MASK_LINE_SCAN_LEN])
-                   for p in _LABEL_UPGRADE_PATTERNS):
+            if any(p.search(ln) for p in _LABEL_UPGRADE_PATTERNS):
                 out_lines.append(_SLICE_MASK_MARKER)
             else:
                 out_lines.append(ln)
