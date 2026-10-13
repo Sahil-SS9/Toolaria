@@ -235,10 +235,14 @@ def register(ctx) -> None:
             _store.backfill_labels()
         except Exception as e:
             logger.warning("toolaria: label backfill failed: %s", e)
-        _store.lazy_sweep()
     except Exception as e:
         logger.warning("toolaria: blob store init failed, rescuing disabled: %s", e)
         _store = None
+    if _store is not None:
+        try:
+            _store.lazy_sweep()
+        except Exception as e:
+            logger.warning("toolaria: initial sweep failed; store remains usable: %s", e)
 
     ctx.register_hook("transform_tool_result", _on_transform)
     ctx.register_hook("on_session_start", _on_start)

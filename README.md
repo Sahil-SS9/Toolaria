@@ -204,6 +204,25 @@ All keys in `config.yaml` with defaults:
 | `toolaria_key_file` | *(unset)* | Path to a Fernet key file for credential-tier encryption (see below) |
 | `sensitivity_tool_labels` | `{}` | `{tool_name: label}` overrides for the built-in tool→label map |
 
+### Shared-store cleanup
+
+On POSIX systems, a private `.store.lock` serialises cleanup with blob/index
+publication and metadata updates across processes. A sweep cannot delete a
+blob between its byte write and session-reference save, or use a stale live
+reference snapshot while another process adopts it. The lock is re-entrant
+within a thread and released automatically when an operation or process exits.
+Do not remove the lock file while the store is in use.
+
+TTL cleanup collects live references in one index pass. Size-cap eviction
+updates references in a batch, instead of rereading every index for every
+removed blob. Already-removed files are harmless, and a failed initial sweep
+is logged without disabling an otherwise usable store.
+
+Upgrade and restart **all processes sharing a `store_path`** together: older
+clients do not participate in this advisory lock. Use a local filesystem with
+working POSIX `flock` semantics. Where POSIX locking is unavailable, Toolaria
+logs a warning and coordinates threads only; use one process per store.
+
 ### Excerpt budget contract
 
 `excerpt_max_chars` is an **exact cap** on the excerpt block that lands in

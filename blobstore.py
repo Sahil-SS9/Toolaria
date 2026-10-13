@@ -7,6 +7,8 @@ import re
 import tempfile
 import time
 import threading
+from contextlib import contextmanager
+from functools import wraps
 from pathlib import Path
 
 try:
@@ -183,7 +185,38 @@ def _scrub(value):
         return _SECRET_VALUE_RE.sub(_REDACTED, value)
     return value
 
-_LOCK = threading.Lock()
+_LOCK = threading.RLock()
+_STORE_LOCK_STATE = threading.local()
+_STORE_LOCK_FDS: set[int] = set()
+
+
+def _reset_store_locks_after_fork():
+    # Close inherited descriptors without LOCK_UN: unlocking a shared open
+    # file description in the child would also unlock the parent's operation.
+    global _LOCK, _STORE_LOCK_STATE, _STORE_LOCK_FDS
+    for fd in _STORE_LOCK_FDS:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+    _LOCK = threading.RLock()
+    _STORE_LOCK_STATE = threading.local()
+    _STORE_LOCK_FDS = set()
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_reset_store_locks_after_fork)
+
+
+def _store_operation(method):
+    """Serialise a complete publication/metadata operation with cleanup."""
+    @wraps(method)
+    def guarded(self, *args, **kwargs):
+        with self._store_guard():
+            return method(self, *args, **kwargs)
+    return guarded
+
+
 _BLOB_ID_RE = re.compile(r"^[0-9a-f]{12}$")
 
 
@@ -360,6 +393,7 @@ class BlobStore:
         bp.mkdir(parents=True, exist_ok=True)
         _chmod_safe(bp, _DIR_MODE)
         self.store_path = bp
+        self._store_lock_path = bp / ".store.lock"
         self.blob_dir = bp / "blobs"
         self.meta_dir = bp / "sessions"
         self.sidecar_dir = bp / "sidecars"
@@ -378,7 +412,8 @@ class BlobStore:
         # Records fetch timestamps; recency-weighted count computed during sweep.
         # Persisted to index entries during sweep; reloaded on init.
         self._fetch_log: dict[tuple[str, str], list[float]] = {}
-        self._load_fetch_log()
+        with self._store_guard():
+            self._load_fetch_log()
         # T1.2: sequences sidecar lazily created on first write when enabled.
         self._sequences_dir = bp / "sequences"
         # RISKY-3 (Phase 4): dedicated lockfile for cross-process
@@ -424,6 +459,47 @@ class BlobStore:
         # None = unknown (scan needed), True/False = cached verdict.
         # Written through by put() when it stamps enc=True.
         self._enc_cache: dict[str, bool] = {}
+
+    @contextmanager
+    def _store_guard(self):
+        """One re-entrant lock shared by every writer and sweep of this store.
+
+        The thread lock protects the nesting registry; flock protects the
+        complete blob/index transaction across POSIX processes. Never unlink
+        the lock file: replacing its inode would split the coordination domain.
+        Lock acquisition failures propagate rather than publishing unguarded.
+        """
+        with _LOCK:
+            if not _HAVE_FCNTL:
+                if not getattr(self, "_store_lock_warning", False):
+                    logger.warning(
+                        "toolaria: POSIX flock unavailable; use one process "
+                        "per store_path (thread-only coordination)")
+                    self._store_lock_warning = True
+                yield
+                return
+            active = getattr(_STORE_LOCK_STATE, "active", None)
+            if active is None:
+                active = _STORE_LOCK_STATE.active = {}
+            key = str(self.store_path)
+            if key in active:
+                yield
+                return
+            flags = os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0)
+            fd = os.open(self._store_lock_path, flags, _FILE_MODE)
+            _STORE_LOCK_FDS.add(fd)
+            try:
+                os.fchmod(fd, _FILE_MODE)
+                fcntl.flock(fd, fcntl.LOCK_EX)
+                active[key] = fd
+                try:
+                    yield
+                finally:
+                    del active[key]
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+            finally:
+                _STORE_LOCK_FDS.discard(fd)
+                os.close(fd)
 
     # ── T4.2 encryption helpers (Fernet at-rest, credential-only) ─────
 
@@ -676,6 +752,7 @@ class BlobStore:
 
     # ── T4.3 key rotation ────────────────────────────────────────────────
 
+    @_store_operation
     def rotate_key(self, new_key_path: str) -> int:
         """Re-encrypt every encrypted credential blob under a new
         Fernet key in one pass. Returns the number of blobs
@@ -944,6 +1021,7 @@ class BlobStore:
                 return None
         return None
 
+    @_store_operation
     def write_sidecar(self, blob_id: str, suffix: str, data) -> None:
         p = self.sidecar_path(blob_id, suffix)
         if p is None:
@@ -962,6 +1040,7 @@ class BlobStore:
             except OSError:
                 pass
 
+    @_store_operation
     def delete_sidecars(self, blob_id: str, *, strict: bool = False) -> None:
         """Delete every cached sidecar for *blob_id*.
 
@@ -976,6 +1055,7 @@ class BlobStore:
                 if strict:
                     raise
 
+    @_store_operation
     def blob_text(self, blob_id: str) -> str | None:
         """Decoded blob content, or None if missing or binary.
 
@@ -1005,6 +1085,7 @@ class BlobStore:
         except UnicodeDecodeError:
             return None
 
+    @_store_operation
     def build_outline(self, blob_id: str, text: str) -> dict:
         """Build and cache the structural outline for a blob (cheap, sync).
         Safe to call at rescue time.
@@ -1054,6 +1135,7 @@ class BlobStore:
 
     # ── semantic search ──
 
+    @_store_operation
     def _chunks(self, blob_id: str, text: str) -> tuple[list[dict], bool]:
         """Line-aligned chunks for a blob, cached as a sidecar.
         Returns (chunks, truncated) where truncated means the blob was larger
@@ -1186,6 +1268,7 @@ class BlobStore:
             cur = prev_meta
         return None
 
+    @_store_operation
     def put(self, content: str, tool_name: str = "", session_id: str = "",
             args=None, label=None) -> str:
         """Store content, return short blob_id (first 12 hex of SHA256).
@@ -1477,6 +1560,7 @@ class BlobStore:
             self._save_idx(idx, sid)
         return bid
 
+    @_store_operation
     def backfill_labels(self) -> None:
         """Phase-3 migration: walk every index entry lacking a label and
         stamp it from ``label_for_tool`` + ``label_for_args``.
@@ -1526,6 +1610,7 @@ class BlobStore:
                         ip, exc,
                     )
 
+    @_store_operation
     def _refresh_blob(self, blob_id: str, session_id: str,
                        turn: int | None = None) -> None:
         """Bump the access time of a blob's index entry so a result the model
@@ -2047,6 +2132,7 @@ class BlobStore:
             out = out[:cap]
         return out, min(len(out), cap)
 
+    @_store_operation
     def _charge_slice_budget(self, blob_id: str, session_id: str,
                               served: int, *, mask_slices: bool) -> None:
         """FIX-2: track cumulative chars served for *blob_id* since the
@@ -2345,6 +2431,7 @@ class BlobStore:
 
     # ── sweep ──────────────────────────────
 
+    @_store_operation
     def lazy_sweep(self):
         """Expire blobs past TTL or over the size limit, oldest first.
 
@@ -2574,6 +2661,7 @@ class BlobStore:
         hot_ttl = self.cfg.get("hot_ttl_hours", 168) * 3600
         threshold = self.cfg.get("hot_fetch_threshold", 3.0)
         half_life = self.cfg.get("fetch_decay_half_life_hours", 24) * 3600
+        live = set()
         for ip in sorted(self.meta_dir.glob("*.json")):
             safe_sid = ip.stem
             idx = self._read_idx_file(ip)
@@ -2662,6 +2750,8 @@ class BlobStore:
             # when no sweep/tombstone change occurred.
             if self._flush_fetch_log(safe_sid, idx):
                 changed = True
+            live.update(bid for bid, entry in blobs.items()
+                        if entry and self._is_live(entry))
             if changed:
                 self._write_idx_file(ip, idx)
 
@@ -2669,8 +2759,8 @@ class BlobStore:
         # their sidecar index/vector artefacts.
         for bf in self.blob_dir.iterdir():
             if bf.is_file() and _BLOB_ID_RE.match(bf.name):
-                if not self._any_live_refs(bf.name):
-                    bf.unlink()
+                if bf.name not in live:
+                    bf.unlink(missing_ok=True)
                     self.delete_sidecars(bf.name)
 
     def _sidecar_bytes(self, bid: str) -> int:
@@ -2691,25 +2781,39 @@ class BlobStore:
             if bf.is_file() and _BLOB_ID_RE.match(bf.name):
                 # A blob's cap weight is its file plus its sidecars, since
                 # eviction frees both.
-                sz = bf.stat().st_size + self._sidecar_bytes(bf.name)
-                all_blobs.append((bf.stat().st_ctime, sz, bf))
+                try:
+                    stat = bf.stat()
+                except FileNotFoundError:
+                    continue
+                sz = stat.st_size + self._sidecar_bytes(bf.name)
+                all_blobs.append((stat.st_ctime, sz, bf))
         all_blobs.sort()  # oldest first
         total = sum(sz for _, sz, _ in all_blobs)
+        evicted = []
         for _, sz, bf in all_blobs:
             if total <= max_bytes:
                 break
-            self._tombstone_everywhere(bf.name, now)
-            if bf.exists():
-                bf.unlink()
-            self.delete_sidecars(bf.name)
+            evicted.append(bf)
             total -= sz
+        # Scan/rewrite each index once for the entire eviction batch, not
+        # once per blob. The store guard pins the selected references.
+        if evicted:
+            self._tombstone_everywhere({bf.name for bf in evicted}, now)
+        for bf in evicted:
+            bf.unlink(missing_ok=True)
+            self.delete_sidecars(bf.name)
 
-    def _tombstone_everywhere(self, bid: str, now) -> None:
-        """Convert every live reference to a blob into a tombstone."""
+    def _tombstone_everywhere(self, blob_ids: str | set[str], now) -> None:
+        """Convert every live reference to the eviction batch into tombstones."""
+        if isinstance(blob_ids, str):
+            blob_ids = {blob_ids}
         for ip in sorted(self.meta_dir.glob("*.json")):
             idx = self._read_idx_file(ip)
-            entry = idx.get("blobs", {}).get(bid)
-            if entry and self._is_live(entry):
+            changed = False
+            for bid in blob_ids & idx.get("blobs", {}).keys():
+                entry = idx["blobs"][bid]
+                if not entry or not self._is_live(entry):
+                    continue
                 idx["blobs"][bid] = {
                     "swept_at": now,
                     "tool": entry.get("tool", ""),
@@ -2727,6 +2831,8 @@ class BlobStore:
                     "entity_kinds": list(
                         entry.get("entity_kinds", []) or []),
                 }
+                changed = True
+            if changed:
                 self._write_idx_file(ip, idx)
 
     def _any_live_refs(self, bid: str) -> bool:
