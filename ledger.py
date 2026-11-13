@@ -18,6 +18,11 @@ import os
 import time
 from pathlib import Path
 
+if __package__:
+    from .hermes_home import default_store_path as _default_store_path_shared
+else:
+    from hermes_home import default_store_path as _default_store_path_shared  # type: ignore[no-redef]
+
 logger = logging.getLogger(__name__)
 
 _DIR_MODE = 0o700
@@ -32,12 +37,21 @@ def _safe_chmod(path: Path, mode: int) -> None:
                      path, mode, exc)
 
 
+def _default_store_path() -> Path:
+    """Blob store under the Hermes home.
+
+    Resolution lives in :mod:`hermes_home` so a process without ``HERMES_HOME``
+    cannot create a second store beside the real one.
+    """
+    return _default_store_path_shared()
+
+
 def ledger_path(cfg: dict, kind: str = "expansions") -> Path:
     """Resolve the canonical ledger file path for *kind* under store_path.
 
     kinds: expansions (T1.5 audit ledger).
     """
-    bp = Path(cfg.get("store_path", "~/.hermes/toolaria")).expanduser().resolve()
+    bp = (Path(cfg["store_path"]).expanduser() if cfg.get("store_path") else _default_store_path()).resolve()
     return bp / "ledger" / f"{kind}.jsonl"
 
 

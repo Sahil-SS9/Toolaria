@@ -29,10 +29,12 @@ if __package__:
     from .blobstore import BlobStore, _BLOB_ID_RE
     from .excerpt import detect_type, build_excerpt, build_excerpt_meta
     from .passref import make_middleware as _make_passref_mw
+    from .hermes_home import hermes_home
 else:
     from blobstore import BlobStore, _BLOB_ID_RE  # type: ignore[no-redef]
     from excerpt import detect_type, build_excerpt, build_excerpt_meta  # type: ignore[no-redef]
     from passref import make_middleware as _make_passref_mw  # type: ignore[no-redef]
+    from hermes_home import hermes_home  # type: ignore[no-redef]
 
 logger = logging.getLogger(__name__)
 
@@ -113,16 +115,43 @@ def _is_rescuable(tool_name: str) -> bool:
 
 
 def _safe_cfg(ctx) -> dict:
-    """Read plugin config from PluginContext or config.yaml fallback."""
-    try:
-        cfg = ctx.config.get("toolaria")
-        if cfg:
-            return dict(cfg)
-    except Exception:
-        pass
+    """Read the operator's plugin settings, excluding the plugin-local defaults layer.
+
+    Sources, first hit wins:
+
+    1. ``ctx.get_config(key)`` — the host's ``plugins.entries.toolaria.settings``
+       subtree. This is the supported API. The pre-2026-11 spelling
+       ``ctx.config.get("toolaria")`` does not exist on current hosts, so a
+       plugin written against it silently ignored every configured setting and
+       fell through to the plugin-local defaults — which is how profile loads
+       ended up on the ``~/.hermes`` store.
+    2. A legacy ``ctx.config`` dict, kept for hosts and test doubles that model
+       the old shape. Never shadows ``get_config``.
+    3. ``$HERMES_HOME/config.yaml``'s ``toolaria:`` block, for installs that
+       predate ``plugins.entries``.
+    """
+    cfg: dict = {}
+    getter = getattr(ctx, "get_config", None)
+    if callable(getter):
+        for key in list(_load_defaults().keys()) + list(_CFG_EXTRA_KEYS):
+            try:
+                val = getter(key)
+            except Exception:
+                continue
+            if val is not None:
+                cfg[key] = val
+    if cfg:
+        return cfg
+    # Compatibility layer: the old ``ctx.config`` dict and the test doubles that
+    # still model it. Absent on current hosts, so this never shadows get_config.
+    legacy = getattr(ctx, "config", None)
+    if isinstance(legacy, dict):
+        block = legacy.get("toolaria")
+        if block:
+            return dict(block)
     try:
         import yaml
-        hp = Path(os.environ.get("HERMES_HOME", "~/.hermes")).expanduser()
+        hp = hermes_home()
         cf = hp / "config.yaml"
         if cf.exists():
             raw = yaml.safe_load(cf.read_text())
@@ -130,6 +159,10 @@ def _safe_cfg(ctx) -> dict:
     except Exception:
         pass
     return {}
+
+
+# Keys a plugin may set that the plugin-local config.yaml does not name.
+_CFG_EXTRA_KEYS = ("store_path", "toolaria_key_file")
 
 
 _CWD = Path(__file__).resolve().parent
@@ -385,8 +418,8 @@ def _rotate_key_cmd(raw_args: str = "") -> str:
                 f"directory ({store_path})")
     new_path = str(new_path_p)
 
-    hermes_home = Path(os.environ.get("HERMES_HOME", "~/.hermes")).expanduser()
-    cfg_path = hermes_home / "config.yaml"
+    home_dir = hermes_home()
+    cfg_path = home_dir / "config.yaml"
     if not cfg_path.is_file():
         return (f"Error: durable Hermes config not found at {cfg_path}; "
                 "rotation was not started")
