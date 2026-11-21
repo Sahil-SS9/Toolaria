@@ -18,6 +18,7 @@ def test_hermes_home_env_wins(monkeypatch, tmp_path):
     assert default_store_path() == tmp_path / "launch" / "toolaria"
 
 
+@pytest.mark.skipif(os.name != "nt", reason="LOCALAPPDATA launch scope is Windows-only")
 def test_empty_hermes_home_is_not_authoritative(monkeypatch, tmp_path):
     """An empty string must not resolve to the cwd-relative empty path."""
     monkeypatch.setenv("HERMES_HOME", "")
