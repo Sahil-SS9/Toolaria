@@ -31,6 +31,7 @@ if __package__:
     from .entities import (get_registry as _entity_registry,
                               extract_entities as _extract_entities,
                               distinct_entity_kinds as _distinct_entity_kinds)
+    from .hermes_home import default_store_path as _default_store_path_shared
 else:
     from excerpt import detect_type as _detect_type  # type: ignore[no-redef]
     from index import build_outline as _struct_outline  # type: ignore[no-redef]
@@ -44,6 +45,7 @@ else:
     from entities import (get_registry as _entity_registry,  # type: ignore[no-redef]
                             extract_entities as _extract_entities,  # type: ignore[no-redef]
                             distinct_entity_kinds as _distinct_entity_kinds)  # type: ignore[no-redef]
+    from hermes_home import default_store_path as _default_store_path_shared  # type: ignore[no-redef]
 
 
 # Sensitivity ordering for content-aware label resolution (FIX-1). The
@@ -386,10 +388,19 @@ _META_CHARS = set(r".^$*+?{}[]\|()")
 _CONTROL_RE = re.compile(r"[\x00-\x1f]")
 
 
+def _default_store_path() -> Path:
+    """Blob store under the Hermes home.
+
+    Resolution lives in :mod:`hermes_home` so a process without ``HERMES_HOME``
+    cannot create a second store beside the real one.
+    """
+    return _default_store_path_shared()
+
+
 class BlobStore:
     def __init__(self, cfg: dict):
         self.cfg = cfg
-        bp = Path(cfg.get("store_path", "~/.hermes/toolaria")).expanduser().resolve()
+        bp = (Path(cfg["store_path"]).expanduser() if cfg.get("store_path") else _default_store_path()).resolve()
         # Create root first so the subsequent sub-dir mkdirs do not need
         # parents=True (and thus skip the root chmod below).
         bp.mkdir(parents=True, exist_ok=True)

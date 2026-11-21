@@ -1,5 +1,5 @@
 # Defaults for toolaria plugin.
-# Override in ~/.hermes/config.yaml under toolaria: key.
+# Override under the toolaria: key in $HERMES_HOME/config.yaml.
 toolaria:
   max_result_chars: 12000         # rescue results larger than this
   fetch_max_chars: 4000           # cap on range/grep responses
@@ -24,7 +24,8 @@ toolaria:
   hot_ttl_hours: 168               # TTL for hot blobs (7 days)
   fetch_decay_half_life_hours: 24  # half-life for recency weighting
   max_store_mb: 500
-  store_path: ~/.hermes/toolaria
+  # store_path: unset -> $HERMES_HOME/toolaria. Only set this to relocate the store,
+  # and give it an absolute path if you do (the runtime exports HERMES_HOME).
   exclude_tools: []
   refuse_full_fetch: true         # refuse full mode over full_fetch_max_chars
   # Anchor patterns for excerpt: lines matching these patterns are promoted
