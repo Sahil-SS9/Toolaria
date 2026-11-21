@@ -1,5 +1,5 @@
 name: toolaria
-version: "3.1.1"
+version: "3.1.2"
 description: "Rescue oversized MCP/web tool results before they flood context. Stores full result to disk via SHA256-addressed blob store. Returns excerpt + handle block. Provides rescuer_fetch tool (range/grep/search/outline/stat/full) and pass-by-reference (tla:<id>) for downstream tools."
 author: "Sahil Saghir (KENSEI)"
 kind: standalone
@@ -11,3 +11,4 @@ provides_hooks:
   - on_session_end
 provides_middleware:
   - tool_request
+requires_hermes: ">=0.21"
